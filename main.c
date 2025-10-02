@@ -140,6 +140,14 @@ EM_JS(void, js_release_texture, (int texture_id), {
   Module.releaseTexture(texture_id);
 });
 
+EM_JS(int, js_is_key_down, (const char *key), {
+  if (Module.isKeyDown) {
+    const keyName = UTF8ToString(key);
+    return Module.isKeyDown(keyName) ? 1 : 0;
+  }
+  return 0;
+});
+
 EMSCRIPTEN_KEEPALIVE void aroma_image_loaded(uintptr_t image_ptr, int texture_id, int width, int height) {
     AromaImage *img = (AromaImage *)image_ptr;
     if (!img) {
@@ -345,6 +353,22 @@ static int l_graphics_draw(lua_State *L) {
     return 0;
 }
 
+static int l_graphics_getWidth(lua_State *L) {
+    lua_pushinteger(L, g_state.canvas_width);
+    return 1;
+}
+
+static int l_graphics_getHeight(lua_State *L) {
+    lua_pushinteger(L, g_state.canvas_height);
+    return 1;
+}
+
+static int l_graphics_getDimensions(lua_State *L) {
+    lua_pushinteger(L, g_state.canvas_width);
+    lua_pushinteger(L, g_state.canvas_height);
+    return 2;
+}
+
 static int l_image_getWidth(lua_State *L) {
     AromaImage *img = check_image(L, 1);
     lua_pushinteger(L, img->width);
@@ -367,6 +391,20 @@ static int l_image_gc(lua_State *L) {
     return 0;
 }
 
+static int l_keyboard_isDown(lua_State *L) {
+    int numargs = lua_gettop(L);
+
+    for (int i = 1; i <= numargs; i++) {
+        const char *key = luaL_checkstring(L, i);
+        if (js_is_key_down(key)) {
+            lua_pushboolean(L, 1);
+            return 1;
+        }
+    }
+
+    lua_pushboolean(L, 0);
+    return 1;
+}
 
 
 static void register_aroma_api(lua_State *L) {
@@ -413,7 +451,22 @@ static void register_aroma_api(lua_State *L) {
     lua_pushcfunction(L, l_graphics_draw);
     lua_setfield(L, -2, "draw");
 
+    lua_pushcfunction(L, l_graphics_getWidth);
+    lua_setfield(L, -2, "getWidth");
+
+    lua_pushcfunction(L, l_graphics_getHeight);
+    lua_setfield(L, -2, "getHeight");
+
+    lua_pushcfunction(L, l_graphics_getDimensions);
+    lua_setfield(L, -2, "getDimensions");
+
     lua_setfield(L, -2, "graphics"); /* aroma.graphics = table */
+
+    lua_newtable(L);                /* aroma.keyboard */
+    lua_pushcfunction(L, l_keyboard_isDown);
+    lua_setfield(L, -2, "isDown");
+    lua_setfield(L, -2, "keyboard"); /* aroma.keyboard = table */
+
     lua_setglobal(L, "aroma");
 
     /* Create "love" alias for compatibility */
@@ -573,6 +626,10 @@ static int init_webgl(void) {
     glViewport(0, 0, g_state.canvas_width, g_state.canvas_height);
     setup_projection((float)g_state.canvas_width, (float)g_state.canvas_height);
 
+    // Enable alpha blending for transparent images
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
     return 1;
 }
 
@@ -636,6 +693,23 @@ EMSCRIPTEN_KEEPALIVE void aroma_keypressed(const char *key) {
 
     lua_rawgeti(L, LUA_REGISTRYINDEX, g_state.aroma_ref);
     lua_getfield(L, -1, "keypressed");
+    if (lua_isfunction(L, -1)) {
+        lua_pushstring(L, key);
+        if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
+            report_lua_error(L);
+        }
+    } else {
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+}
+
+EMSCRIPTEN_KEEPALIVE void aroma_keyreleased(const char *key) {
+    lua_State *L = g_state.L;
+    if (!L || g_state.aroma_ref == LUA_NOREF) return;
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, g_state.aroma_ref);
+    lua_getfield(L, -1, "keyreleased");
     if (lua_isfunction(L, -1)) {
         lua_pushstring(L, key);
         if (lua_pcall(L, 1, 0, 0) != LUA_OK) {

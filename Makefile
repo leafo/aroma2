@@ -17,7 +17,6 @@ LUA_LIB := \
 	loslib.c lstrlib.c ltablib.c loadlib.c linit.c
 SOURCES := main.c $(addprefix $(LUA_DIR)/,$(LUA_CORE) $(LUA_LIB))
 ASSETS := hi.png
-EXAMPLES_DIR := examples
 
 JS_SRCS := $(shell find js -type f -name '*.js' ! -name 'wasm-aroma.js')
 BUNDLE := $(OUT_DIR)/app.js
@@ -44,7 +43,6 @@ $(HTML_OUT): $(SHELL_FILE) $(BUNDLE) $(TARGET_JS)
 	cp $(WASM_OUT) $(OUT_DIR)/
 	@if [ -f $(DATA_OUT) ]; then cp $(DATA_OUT) $(OUT_DIR)/; fi
 	cp $(ASSETS) $(OUT_DIR)/
-	cp -r $(EXAMPLES_DIR) $(OUT_DIR)/
 
 js:
 	mkdir -p js
