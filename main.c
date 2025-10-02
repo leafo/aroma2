@@ -369,6 +369,49 @@ static int l_graphics_getDimensions(lua_State *L) {
     return 2;
 }
 
+static int l_graphics_rectangle(lua_State *L) {
+    const char *mode = luaL_checkstring(L, 1);
+
+    float x = (float)luaL_checknumber(L, 2);
+    float y = (float)luaL_checknumber(L, 3);
+    float w = (float)luaL_checknumber(L, 4);
+    float h = (float)luaL_checknumber(L, 5);
+
+    // Create 5 vertices for the rectangle (last point closes the loop)
+    float coords[10] = {
+        x, y,
+        x, y + h,
+        x + w, y + h,
+        x + w, y,
+        x, y
+    };
+
+    glUseProgram(g_state.program);
+    glUniformMatrix3fv(g_state.transform_loc, 1, GL_FALSE, current_matrix()->m);
+    glUniformMatrix3fv(g_state.projection_loc, 1, GL_FALSE, g_state.projection);
+    glUniform4fv(g_state.color_loc, 1, g_state.draw_color);
+    if (g_state.use_texture_loc >= 0) {
+        glUniform1i(g_state.use_texture_loc, 0);
+    }
+    glDisableVertexAttribArray(1);
+    glVertexAttrib2f(1, 0.0f, 0.0f);
+
+    glBindBuffer(GL_ARRAY_BUFFER, g_state.vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(coords), coords, GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (const void *)0);
+
+    if (strcmp(mode, "fill") == 0) {
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 5);
+    } else if (strcmp(mode, "line") == 0) {
+        glDrawArrays(GL_LINE_STRIP, 0, 5);
+    } else {
+        return luaL_error(L, "love.graphics.rectangle: mode must be 'fill' or 'line'");
+    }
+
+    return 0;
+}
+
 static int l_image_getWidth(lua_State *L) {
     AromaImage *img = check_image(L, 1);
     lua_pushinteger(L, img->width);
@@ -459,6 +502,9 @@ static void register_aroma_api(lua_State *L) {
 
     lua_pushcfunction(L, l_graphics_getDimensions);
     lua_setfield(L, -2, "getDimensions");
+
+    lua_pushcfunction(L, l_graphics_rectangle);
+    lua_setfield(L, -2, "rectangle");
 
     lua_setfield(L, -2, "graphics"); /* aroma.graphics = table */
 

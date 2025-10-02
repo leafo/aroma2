@@ -31,6 +31,20 @@ function love.keypressed(key)
 end
 
 function love.draw()
+  -- Draw some filled rectangles
+  love.graphics.setColor(0.2, 0.4, 0.8)
+  love.graphics.rectangle('fill', 50, 50, 100, 80)
+
+  love.graphics.setColor(0.8, 0.3, 0.3)
+  love.graphics.rectangle('fill', 650, 50, 120, 60)
+
+  -- Draw some outlined rectangles
+  love.graphics.setColor(0.3, 0.8, 0.4)
+  love.graphics.rectangle('line', 50, 450, 150, 100)
+
+  love.graphics.setColor(0.9, 0.7, 0.2)
+  love.graphics.rectangle('line', 600, 400, 180, 150)
+
   love.graphics.push()
   love.graphics.setColor(1, 0.75, 0.8)
   love.graphics.translate(400, 300)
