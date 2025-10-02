@@ -70,6 +70,39 @@ export async function initAroma(canvas) {
   const Module = await wasmAromaModule(moduleConfig);
   console.log('Aroma WASM module loaded successfully');
 
+  // Map browser key names to Love2D conventions
+  function mapKeyName(key) {
+    const keyMap = {
+      'ArrowUp': 'up',
+      'ArrowDown': 'down',
+      'ArrowLeft': 'left',
+      'ArrowRight': 'right',
+      'Enter': 'return',
+      'Escape': 'escape',
+      ' ': 'space',
+    };
+
+    const mapped = keyMap[key];
+    if (mapped) return mapped;
+
+    // Return lowercase for letters/numbers
+    if (key.length === 1) {
+      return key.toLowerCase();
+    }
+
+    // Return as-is for other keys (e.g., 'Tab', 'Backspace')
+    return key.toLowerCase();
+  }
+
+  // Set up keyboard event handling
+  canvas.setAttribute('tabindex', '0'); // Make canvas focusable
+  canvas.addEventListener('keydown', (e) => {
+    const key = mapKeyName(e.key);
+    if (Module._aroma_keypressed) {
+      Module.ccall('aroma_keypressed', null, ['string'], [key]);
+    }
+  });
+
   return {
     module: Module,
     runCode: (code) => {

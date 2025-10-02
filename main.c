@@ -630,6 +630,23 @@ EMSCRIPTEN_KEEPALIVE int run_lua_code(const char *code) {
     return 0;
 }
 
+EMSCRIPTEN_KEEPALIVE void aroma_keypressed(const char *key) {
+    lua_State *L = g_state.L;
+    if (!L || g_state.aroma_ref == LUA_NOREF) return;
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, g_state.aroma_ref);
+    lua_getfield(L, -1, "keypressed");
+    if (lua_isfunction(L, -1)) {
+        lua_pushstring(L, key);
+        if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
+            report_lua_error(L);
+        }
+    } else {
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+}
+
 int main(void) {
     memset(&g_state, 0, sizeof(g_state));
     g_state.bg_color[3] = 1.0f;
