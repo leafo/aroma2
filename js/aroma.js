@@ -52,6 +52,138 @@ export async function initAroma(canvas) {
       attempt();
     };
 
+    Module.requestFontLoad = async (fontPtr, url, glyphs, _extraSpacing) => {
+      try {
+        const store = ensureTextureStore(Module);
+        if (!store) {
+          console.error('Texture store not ready');
+          return;
+        }
+
+        const response = await fetch(url);
+        if (!response.ok) {
+          throw new Error(`Failed to fetch ${url}: ${response.status}`);
+        }
+        const blob = await response.blob();
+        const bitmap = await createImageBitmap(blob);
+
+        const canvas = document.createElement('canvas');
+        canvas.width = bitmap.width;
+        canvas.height = bitmap.height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          throw new Error('Failed to acquire 2D context for font parsing');
+        }
+
+        ctx.drawImage(bitmap, 0, 0);
+        if (typeof bitmap.close === 'function') {
+          bitmap.close();
+        }
+
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const pixelData = imageData.data;
+        const firstRow = pixelData.slice(0, canvas.width * 4);
+
+        const parsedGlyphs = parseImageFont(firstRow, glyphs, canvas.width);
+
+        if (firstRow.length >= 4) {
+          const spacerR = firstRow[0];
+          const spacerG = firstRow[1];
+          const spacerB = firstRow[2];
+          const spacerA = firstRow[3];
+
+          for (let i = 0; i < pixelData.length; i += 4) {
+            if (
+              pixelData[i] === spacerR &&
+              pixelData[i + 1] === spacerG &&
+              pixelData[i + 2] === spacerB &&
+              pixelData[i + 3] === spacerA
+            ) {
+              pixelData[i + 3] = 0;
+            }
+          }
+
+          ctx.putImageData(imageData, 0, 0);
+        }
+
+        const result = store.createFromSource(canvas, { flipY: true });
+
+        const maxGlyphs = Module._aroma_font_max_glyphs ? Module._aroma_font_max_glyphs() : parsedGlyphs.length;
+        const glyphCount = Math.min(parsedGlyphs.length, maxGlyphs);
+
+        if (parsedGlyphs.length > glyphCount) {
+          console.warn(`Truncating image font glyphs for ${url} to ${glyphCount} entries`);
+        }
+
+        const glyphBufferPtr = Module._get_glyph_buffer();
+        const glyphArray = new Int32Array(Module.HEAP32.buffer, glyphBufferPtr, glyphCount * 3);
+
+        for (let i = 0; i < glyphCount; i++) {
+          glyphArray[i * 3 + 0] = parsedGlyphs[i].x;
+          glyphArray[i * 3 + 1] = parsedGlyphs[i].width;
+          glyphArray[i * 3 + 2] = parsedGlyphs[i].codepoint;
+        }
+
+        Module._aroma_font_set_glyphs(fontPtr, result.id, result.width, result.height, glyphCount);
+      } catch (err) {
+        console.error('Failed to load font', url, err);
+        if (Module._aroma_font_set_glyphs) {
+          Module._aroma_font_set_glyphs(fontPtr, 0, 0, 0, 0);
+        }
+      }
+    };
+
+    // Parse image font glyphs in JavaScript
+    function parseImageFont(pixelData, glyphString, width) {
+      const glyphs = [];
+
+      // First pixel is spacer color
+      const spacer = (pixelData[0] << 24) | (pixelData[1] << 16) | (pixelData[2] << 8) | pixelData[3];
+
+      let start = 0;
+      let end = 0;
+      let glyphIndex = 0;
+
+      // Convert glyph string to array of codepoints
+      const codepoints = Array.from(glyphString).map(char => char.codePointAt(0));
+
+      while (glyphIndex < codepoints.length && end < width) {
+        start = end;
+
+        // Skip spacer pixels
+        while (start < width) {
+          const idx = start * 4;
+          const pixel = (pixelData[idx] << 24) | (pixelData[idx + 1] << 16) |
+                       (pixelData[idx + 2] << 8) | pixelData[idx + 3];
+          if (pixel !== spacer) break;
+          start++;
+        }
+
+        end = start;
+
+        // Find end of glyph
+        while (end < width) {
+          const idx = end * 4;
+          const pixel = (pixelData[idx] << 24) | (pixelData[idx + 1] << 16) |
+                       (pixelData[idx + 2] << 8) | pixelData[idx + 3];
+          if (pixel === spacer) break;
+          end++;
+        }
+
+        if (start >= end) break;
+
+        glyphs.push({
+          x: start,
+          width: end - start,
+          codepoint: codepoints[glyphIndex]
+        });
+
+        glyphIndex++;
+      }
+
+      return glyphs;
+    }
+
     Module.bindTexture = (id) => {
       const store = ensureTextureStore(Module);
       if (!store || !store.bind(id)) {

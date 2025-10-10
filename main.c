@@ -11,6 +11,7 @@
 #include <string.h>
 
 #define STACK_MAX 32
+#define MAX_GLYPHS 256
 
 typedef struct {
     float m[9];
@@ -22,6 +23,23 @@ typedef struct {
     int height;
     int loaded;
 } AromaImage;
+
+typedef struct {
+    int x;           // x position in texture
+    int width;       // width of glyph
+    uint32_t codepoint; // character code
+} GlyphInfo;
+
+typedef struct {
+    int texture_id;
+    int image_width;
+    int image_height;
+    GlyphInfo glyphs[MAX_GLYPHS];
+    int glyph_count;
+    float extra_spacing;
+    float line_height;
+    int loaded;
+} AromaFont;
 
 typedef struct {
     lua_State *L;
@@ -42,6 +60,7 @@ typedef struct {
     double last_time;
     int canvas_width;
     int canvas_height;
+    AromaFont *current_font;
 } EngineState;
 
 static EngineState g_state;
@@ -148,6 +167,16 @@ EM_JS(int, js_is_key_down, (const char *key), {
   return 0;
 });
 
+EM_JS(void, js_request_font_load, (uintptr_t font_ptr, const char *path, const char *glyphs_str, double extra_spacing), {
+  if (Module.requestFontLoad) {
+    const url = UTF8ToString(path);
+    const glyphs = UTF8ToString(glyphs_str);
+    Module.requestFontLoad(font_ptr, url, glyphs, extra_spacing);
+  } else {
+    console.error('Module.requestFontLoad is not defined');
+  }
+});
+
 EMSCRIPTEN_KEEPALIVE void aroma_image_loaded(uintptr_t image_ptr, int texture_id, int width, int height) {
     AromaImage *img = (AromaImage *)image_ptr;
     if (!img) {
@@ -157,6 +186,33 @@ EMSCRIPTEN_KEEPALIVE void aroma_image_loaded(uintptr_t image_ptr, int texture_id
     img->width = width;
     img->height = height;
     img->loaded = texture_id != 0;
+}
+
+// UTF-8 decoder for print function
+static uint32_t utf8_decode(const char **str) {
+    const unsigned char *s = (const unsigned char *)*str;
+    uint32_t codepoint = 0;
+    int len = 0;
+
+    if (s[0] < 0x80) {
+        codepoint = s[0];
+        len = 1;
+    } else if ((s[0] & 0xE0) == 0xC0) {
+        codepoint = ((s[0] & 0x1F) << 6) | (s[1] & 0x3F);
+        len = 2;
+    } else if ((s[0] & 0xF0) == 0xE0) {
+        codepoint = ((s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+        len = 3;
+    } else if ((s[0] & 0xF8) == 0xF0) {
+        codepoint = ((s[0] & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
+        len = 4;
+    } else {
+        codepoint = '?';
+        len = 1;
+    }
+
+    *str += len;
+    return codepoint;
 }
 
 static void parse_color(lua_State *L, int idx, float out[4]) {
@@ -185,6 +241,10 @@ static Mat3 *current_matrix(void) {
 
 static AromaImage *check_image(lua_State *L, int idx) {
     return (AromaImage *)luaL_checkudata(L, idx, "aroma.image");
+}
+
+static AromaFont *check_font(lua_State *L, int idx) {
+    return (AromaFont *)luaL_checkudata(L, idx, "aroma.font");
 }
 
 static int l_graphics_setBackgroundColor(lua_State *L) {
@@ -282,6 +342,88 @@ static int l_graphics_newImage(lua_State *L) {
     luaL_getmetatable(L, "aroma.image");
     lua_setmetatable(L, -2);
     return 1;
+}
+
+static const char *collect_imagefont_glyphs(lua_State *L, int idx, size_t *length_out, int *needs_pop) {
+    int abs_idx = lua_absindex(L, idx);
+
+    if (lua_type(L, abs_idx) == LUA_TSTRING) {
+        return luaL_checklstring(L, abs_idx, length_out);
+    }
+
+    if (lua_type(L, abs_idx) == LUA_TTABLE) {
+        luaL_Buffer buf;
+        luaL_buffinit(L, &buf);
+        lua_Integer len = luaL_len(L, abs_idx);
+
+        for (lua_Integer i = 1; i <= len; ++i) {
+            lua_rawgeti(L, abs_idx, i);
+            size_t glyph_len = 0;
+            const char *glyph = luaL_checklstring(L, -1, &glyph_len);
+            if (glyph_len == 0) {
+                lua_pop(L, 1);
+                continue;
+            }
+
+            const char *scan = glyph;
+            utf8_decode(&scan);
+            if (*scan != '\0') {
+                lua_pop(L, 1);
+                luaL_error(L, "love.graphics.newImageFont: glyph table entries must be single UTF-8 characters");
+                return NULL;
+            }
+
+            luaL_addlstring(&buf, glyph, glyph_len);
+            lua_pop(L, 1);
+        }
+
+        luaL_pushresult(&buf);
+        if (needs_pop) {
+            *needs_pop = 1;
+        }
+        return lua_tolstring(L, -1, length_out);
+    }
+
+    luaL_argerror(L, idx, "string or table expected");
+    return NULL;
+}
+
+static GlyphInfo *find_glyph(AromaFont *font, uint32_t codepoint) {
+    if (!font) {
+        return NULL;
+    }
+
+    for (int i = 0; i < font->glyph_count; ++i) {
+        if (font->glyphs[i].codepoint == codepoint) {
+            return &font->glyphs[i];
+        }
+    }
+
+    return NULL;
+}
+
+static int count_printable_glyphs(AromaFont *font, const char *text, int has_fallback) {
+    int count = 0;
+    const char *ptr = text;
+
+    while (*ptr) {
+        uint32_t codepoint = utf8_decode(&ptr);
+
+        if (codepoint == '\n' || codepoint == '\r' || codepoint == '\t') {
+            continue;
+        }
+
+        if (find_glyph(font, codepoint)) {
+            count++;
+            continue;
+        }
+
+        if (has_fallback) {
+            count++;
+        }
+    }
+
+    return count;
 }
 
 static int l_graphics_draw(lua_State *L) {
@@ -434,6 +576,199 @@ static int l_image_gc(lua_State *L) {
     return 0;
 }
 
+static int l_graphics_newImageFont(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+    int needs_pop = 0;
+    const char *glyphs = collect_imagefont_glyphs(L, 2, NULL, &needs_pop);
+    double spacing = luaL_optnumber(L, 3, 0.0);
+
+    AromaFont *font = (AromaFont *)lua_newuserdata(L, sizeof(AromaFont));
+    memset(font, 0, sizeof(AromaFont));
+    font->extra_spacing = (float)spacing;
+    font->line_height = 0.0f;
+    font->loaded = 0;
+
+    js_request_font_load((uintptr_t)font, path, glyphs, spacing);
+
+    if (needs_pop) {
+        lua_pop(L, 1);
+    }
+
+    luaL_getmetatable(L, "aroma.font");
+    lua_setmetatable(L, -2);
+    return 1;
+}
+
+static int l_graphics_setFont(lua_State *L) {
+    if (lua_isnoneornil(L, 1)) {
+        g_state.current_font = NULL;
+        return 0;
+    }
+
+    AromaFont *font = check_font(L, 1);
+    g_state.current_font = font;
+    return 0;
+}
+
+static int l_graphics_print(lua_State *L) {
+    const char *text = luaL_checkstring(L, 1);
+    float x = (float)luaL_optnumber(L, 2, 0.0);
+    float y = (float)luaL_optnumber(L, 3, 0.0);
+
+    AromaFont *font = g_state.current_font;
+    if (!font || !font->loaded || font->texture_id == 0 || font->glyph_count == 0) {
+        return 0;
+    }
+
+    GlyphInfo *fallback = find_glyph(font, (uint32_t)'?');
+    int drawable_count = count_printable_glyphs(font, text, fallback != NULL);
+    if (drawable_count <= 0) {
+        return 0;
+    }
+
+    float *vertices = (float *)malloc(sizeof(float) * drawable_count * 4 * 4);
+    if (!vertices) {
+        return luaL_error(L, "love.graphics.print: out of memory");
+    }
+
+    float inv_width = font->image_width > 0 ? 1.0f / font->image_width : 0.0f;
+    float inv_height = font->image_height > 0 ? 1.0f / font->image_height : 0.0f;
+    float glyph_height_px = font->image_height > 1 ? (float)(font->image_height - 1) : (float)font->image_height;
+    float line_height = font->line_height > 0.0f ? font->line_height : glyph_height_px;
+
+    if (glyph_height_px <= 0.0f) {
+        glyph_height_px = 1.0f;
+    }
+    if (line_height <= 0.0f) {
+        line_height = glyph_height_px;
+    }
+
+    float cursor_x = x;
+    float cursor_y = y;
+    const float base_x = x;
+
+    const char *ptr = text;
+    int vertex_count = 0;
+
+    while (*ptr) {
+        uint32_t codepoint = utf8_decode(&ptr);
+
+        if (codepoint == '\n') {
+            cursor_x = base_x;
+            cursor_y += line_height;
+            continue;
+        }
+
+        if (codepoint == '\r') {
+            cursor_x = base_x;
+            continue;
+        }
+
+        if (codepoint == '\t') {
+            GlyphInfo *space = find_glyph(font, (uint32_t)' ');
+            float tab_advance = space ? (float)space->width + font->extra_spacing : line_height * 0.5f;
+            cursor_x += tab_advance * 4.0f;
+            continue;
+        }
+
+        GlyphInfo *glyph = find_glyph(font, codepoint);
+        if (!glyph) {
+            glyph = fallback;
+            if (!glyph) {
+                continue;
+            }
+        }
+
+        float advance = (float)glyph->width + font->extra_spacing;
+
+        if (glyph->width > 0 && inv_width > 0.0f && inv_height >= 0.0f) {
+            float x1 = cursor_x;
+            float x2 = cursor_x + (float)glyph->width;
+            float y1 = cursor_y;
+            float y2 = cursor_y + glyph_height_px;
+
+            float u1 = glyph->x * inv_width;
+            float u2 = (glyph->x + glyph->width) * inv_width;
+            float v1 = font->image_height > 1 ? inv_height : 0.0f;
+            float v2 = font->image_height > 0 ? 1.0f : 0.0f;
+
+            vertices[vertex_count++] = x1;
+            vertices[vertex_count++] = y1;
+            vertices[vertex_count++] = u1;
+            vertices[vertex_count++] = v1;
+
+            vertices[vertex_count++] = x1;
+            vertices[vertex_count++] = y2;
+            vertices[vertex_count++] = u1;
+            vertices[vertex_count++] = v2;
+
+            vertices[vertex_count++] = x2;
+            vertices[vertex_count++] = y2;
+            vertices[vertex_count++] = u2;
+            vertices[vertex_count++] = v2;
+
+            vertices[vertex_count++] = x2;
+            vertices[vertex_count++] = y1;
+            vertices[vertex_count++] = u2;
+            vertices[vertex_count++] = v1;
+        }
+
+        cursor_x += advance;
+    }
+
+    if (vertex_count > 0) {
+        glUseProgram(g_state.program);
+        glUniformMatrix3fv(g_state.transform_loc, 1, GL_FALSE, current_matrix()->m);
+        glUniformMatrix3fv(g_state.projection_loc, 1, GL_FALSE, g_state.projection);
+        glUniform4fv(g_state.color_loc, 1, g_state.draw_color);
+        if (g_state.use_texture_loc >= 0) {
+            glUniform1i(g_state.use_texture_loc, 1);
+        }
+
+        glActiveTexture(GL_TEXTURE0);
+        js_bind_texture(font->texture_id);
+        if (g_state.sampler_loc >= 0) {
+            glUniform1i(g_state.sampler_loc, 0);
+        }
+
+        glBindBuffer(GL_ARRAY_BUFFER, g_state.vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(float) * vertex_count, vertices, GL_DYNAMIC_DRAW);
+
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (const void *)0);
+
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (const void *)(2 * sizeof(float)));
+
+        int num_quads = vertex_count / 16;
+        for (int i = 0; i < num_quads; i++) {
+            glDrawArrays(GL_TRIANGLE_FAN, i * 4, 4);
+        }
+
+        glDisableVertexAttribArray(1);
+    }
+
+    free(vertices);
+    return 0;
+}
+
+static int l_font_gc(lua_State *L) {
+    AromaFont *font = check_font(L, 1);
+    if (font->texture_id) {
+        js_release_texture(font->texture_id);
+    }
+    font->texture_id = 0;
+    font->glyph_count = 0;
+    font->image_width = 0;
+    font->image_height = 0;
+    font->line_height = 0.0f;
+    font->loaded = 0;
+    if (g_state.current_font == font) {
+        g_state.current_font = NULL;
+    }
+    return 0;
+}
+
 static int l_keyboard_isDown(lua_State *L) {
     int numargs = lua_gettop(L);
 
@@ -460,6 +795,15 @@ static void register_aroma_api(lua_State *L) {
         lua_setfield(L, -2, "getWidth");
         lua_pushcfunction(L, l_image_getHeight);
         lua_setfield(L, -2, "getHeight");
+        lua_setfield(L, -2, "__index");
+    }
+    lua_pop(L, 1);
+
+    if (luaL_newmetatable(L, "aroma.font")) {
+        lua_pushcfunction(L, l_font_gc);
+        lua_setfield(L, -2, "__gc");
+
+        lua_newtable(L);
         lua_setfield(L, -2, "__index");
     }
     lua_pop(L, 1);
@@ -505,6 +849,15 @@ static void register_aroma_api(lua_State *L) {
 
     lua_pushcfunction(L, l_graphics_rectangle);
     lua_setfield(L, -2, "rectangle");
+
+    lua_pushcfunction(L, l_graphics_newImageFont);
+    lua_setfield(L, -2, "newImageFont");
+
+    lua_pushcfunction(L, l_graphics_setFont);
+    lua_setfield(L, -2, "setFont");
+
+    lua_pushcfunction(L, l_graphics_print);
+    lua_setfield(L, -2, "print");
 
     lua_setfield(L, -2, "graphics"); /* aroma.graphics = table */
 
@@ -714,6 +1067,7 @@ EMSCRIPTEN_KEEPALIVE int run_lua_code(const char *code) {
 
     luaL_openlibs(g_state.L);
     register_aroma_api(g_state.L);
+    g_state.current_font = NULL;
 
     if (luaL_loadstring(g_state.L, code) != LUA_OK) {
         report_lua_error(g_state.L);

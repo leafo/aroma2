@@ -2,7 +2,7 @@ export function createTextureStore(gl) {
   const textures = new Map();
   let nextId = 1;
 
-  function createTextureFromBitmap(bitmap, opts = {}) {
+  function createTextureFromSource(source, opts = {}) {
     const tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, tex);
 
@@ -19,11 +19,13 @@ export function createTextureStore(gl) {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, min);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrapS);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrapT);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
 
+    const width = source.width || source.videoWidth || source.naturalWidth || 0;
+    const height = source.height || source.videoHeight || source.naturalHeight || 0;
     const id = nextId++;
-    textures.set(id, { tex, width: bitmap.width, height: bitmap.height });
-    return { id, width: bitmap.width, height: bitmap.height };
+    textures.set(id, { tex, width, height });
+    return { id, width, height };
   }
 
   async function load(url, opts) {
@@ -33,7 +35,11 @@ export function createTextureStore(gl) {
     }
     const blob = await response.blob();
     const bitmap = await createImageBitmap(blob);
-    return createTextureFromBitmap(bitmap, opts);
+    return createTextureFromSource(bitmap, opts);
+  }
+
+  function createFromSource(source, opts) {
+    return createTextureFromSource(source, opts);
   }
 
   function bind(id) {
@@ -52,6 +58,7 @@ export function createTextureStore(gl) {
 
   return {
     load,
+    createFromSource,
     bind,
     release,
   };
