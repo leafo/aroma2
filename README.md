@@ -12,12 +12,14 @@ due to removed APIs: https://github.com/leafo/aroma
 
 Aroma provides a `aroma.*` API and includes a `love.*` alias for compatibility with Love2D-style code.
 
-## Prerequisites
+## Instructions to build locally
 
-- [Emscripten SDK](https://emscripten.org) with `emcc` 
+### Prerequisites
+
+- [Emscripten SDK](https://emscripten.org) with `emcc`
 - [Node.js](https://nodejs.org/) with `esbuild` installed (`npm install --save-dev esbuild`).
 
-## Build
+### Build
 
 ```sh
 make
@@ -28,6 +30,41 @@ The `Makefile` performs these steps:
 1. Compiles Lua + the engine to modular ES-module output (`js/wasm-aroma.js`, `js/wasm-aroma.wasm`).
 2. Bundles the browser entry point (`js/shell.js`) and helper modules with esbuild into `dist/app.js`.
 3. Copies `shell.html` to `dist/index.html`, along with assets and examples.
+
+## Instructions to build using Docker
+
+### Prerequisites
+
+- [Docker](https://www.docker.com/get-started/)
+- [Node.js & NPM](https://nodejs.org/) optional\*
+
+### Build
+
+```sh
+docker compose up --build 'aroma-builder'
+```
+
+alternatively if you have Node.js installed locally you can run:
+
+```sh
+npm run build:docker
+```
+
+This will create the `dist/` directory with the built files.
+
+### Run
+
+```sh
+docker compose up --build 'aroma-server'
+```
+
+alternatively if you have Node.js installed locally you can run:
+
+```sh
+npm run start:docker
+```
+
+This will run a web server at `http://localhost:8080` .
 
 ## Project Layout
 

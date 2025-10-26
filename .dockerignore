@@ -1,0 +1,11 @@
+# Build artifacts
+/dist/
+/lovekit/
+/ludum-dare-30/
+/lua-5.2/
+/node_modules/
+/js/wasm-aroma.js
+/js/wasm-aroma.wasm
+
+# Emscripten cache when built inside dist
+*.tar.gz
