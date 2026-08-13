@@ -360,8 +360,18 @@ static int l_graphics_newImage_cont(lua_State *L) {
     return 1;
 }
 
+/* Loads suspend the engine's entry-point coroutine. A yield from a user
+ * coroutine would surface at its resumer instead, leaving the load with no
+ * thread the completion callback could safely resume. */
+static void check_load_context(lua_State *L, const char *what) {
+    if (L != g_state.script_thread) {
+        luaL_error(L, "%s: cannot load resources inside a user coroutine", what);
+    }
+}
+
 static int l_graphics_newImage(lua_State *L) {
     const char *path = luaL_checkstring(L, 1);
+    check_load_context(L, "love.graphics.newImage");
 
     AromaImage *img = (AromaImage *)lua_newuserdata(L, sizeof(AromaImage));
     memset(img, 0, sizeof(AromaImage));
@@ -629,6 +639,7 @@ static int l_graphics_newImageFont_cont(lua_State *L) {
 
 static int l_graphics_newImageFont(lua_State *L) {
     const char *path = luaL_checkstring(L, 1);
+    check_load_context(L, "love.graphics.newImageFont");
     /* Read spacing before collect_imagefont_glyphs can push the collected
      * glyph string on top of the stack at index 3. */
     double spacing = luaL_optnumber(L, 3, 0.0);
