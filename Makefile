@@ -3,8 +3,8 @@ TARGET_JS := js/wasm-aroma.js
 WASM_OUT := $(TARGET_JS:.js=.wasm)
 DATA_OUT := $(TARGET_JS:.js=.data)
 HTML_OUT := $(OUT_DIR)/index.html
-EMSCRIPTEN_ROOT := /usr/lib/emscripten
-EMCC := $(EMSCRIPTEN_ROOT)/emcc
+EMCC ?= emcc
+ESBUILD ?= node_modules/.bin/esbuild
 EM_CACHE := $(abspath $(OUT_DIR)/.emscripten_cache)
 SHELL_FILE := shell.html
 LUA_DIR := lua-5.2/src
@@ -36,7 +36,7 @@ $(TARGET_JS): main.c | lua-5.2 js
 	EM_CACHE=$(EM_CACHE) $(EMCC) $(SOURCES) $(CFLAGS) $(LDFLAGS) -o $@
 
 $(BUNDLE): $(JS_SRCS) $(TARGET_JS) | $(OUT_DIR)
-	esbuild js/shell.js --bundle --format=esm --platform=browser --outfile=$(BUNDLE)
+	$(ESBUILD) js/shell.js --bundle --format=esm --platform=browser --outfile=$(BUNDLE)
 
 $(HTML_OUT): $(SHELL_FILE) $(BUNDLE) $(TARGET_JS)
 	cp $(SHELL_FILE) $(HTML_OUT)

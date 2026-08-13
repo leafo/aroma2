@@ -29,6 +29,15 @@ The `Makefile` performs these steps:
 2. Bundles the browser entry point (`js/shell.js`) and helper modules with esbuild into `dist/app.js`.
 3. Copies `shell.html` to `dist/index.html`, along with assets and examples.
 
+## GitHub Pages
+
+The `Deploy to GitHub Pages` workflow builds and deploys the editor whenever a
+commit is pushed to `master`. It can also be run manually from the Actions tab.
+
+Before the first deployment, open the repository's **Settings → Pages** and set
+**Source** to **GitHub Actions**. The deployed URL is shown in the workflow's
+`deploy` job and in the repository's Pages settings.
+
 ## Project Layout
 
 - `main.c` — engine glue: embeds Lua 5.2, exposes the `aroma.graphics` API (with `love.*` compatibility alias), and drives the render loop.
