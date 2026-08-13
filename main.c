@@ -51,7 +51,6 @@ typedef enum {
 
 typedef struct {
     lua_State *L;
-    int aroma_ref;
     EMSCRIPTEN_WEBGL_CONTEXT_HANDLE gl_context;
     GLuint program;
     GLuint vbo;
@@ -76,11 +75,18 @@ typedef struct {
      * key events) runs on; non-NULL while suspended on a resource load. */
     lua_State *script_thread;
     int script_thread_ref;
+    /* Coroutine cached between entry points so regular frames reuse one
+     * thread instead of allocating per callback. */
+    lua_State *idle_thread;
+    int idle_thread_ref;
     ScriptEntryPoint script_entry_point;
     /* A draw that resumes from an async load is only being drained so Lua can
      * reach the next load/completion. The next animation frame renders a fresh
      * pass after the coroutine finishes. */
     int discard_rendering;
+    /* Set by resource constructors just before they yield. A yield without it
+     * came from user code and has no completion to resume it. */
+    int resource_wait;
 } EngineState;
 
 static EngineState g_state;
@@ -167,7 +173,8 @@ EM_JS(void, js_request_texture_load, (int generation, uintptr_t image_ptr, const
     Module.requestTextureLoad(generation, image_ptr, url);
   } else {
     console.error('Module.requestTextureLoad is not defined');
-    Module._aroma_image_loaded(generation, image_ptr, 0, 0, 0);
+    /* Deferred so the completion lands after the requester has yielded */
+    setTimeout(() => Module._aroma_image_loaded(generation, image_ptr, 0, 0, 0), 0);
   }
 });
 
@@ -194,7 +201,7 @@ EM_JS(void, js_request_font_load, (int generation, uintptr_t font_ptr, const cha
     Module.requestFontLoad(generation, font_ptr, url, glyphs, extra_spacing);
   } else {
     console.error('Module.requestFontLoad is not defined');
-    Module._aroma_font_set_glyphs(generation, font_ptr, 0, 0, 0, 0);
+    setTimeout(() => Module._aroma_font_set_glyphs(generation, font_ptr, 0, 0, 0, 0), 0);
   }
 });
 
@@ -366,6 +373,7 @@ static int l_graphics_newImage(lua_State *L) {
 
     /* Suspend until the async load completes; aroma_image_loaded resumes the
      * thread and the continuation returns the ready image. */
+    g_state.resource_wait = 1;
     return lua_yieldk(L, 0, 0, l_graphics_newImage_cont);
 }
 
@@ -621,9 +629,11 @@ static int l_graphics_newImageFont_cont(lua_State *L) {
 
 static int l_graphics_newImageFont(lua_State *L) {
     const char *path = luaL_checkstring(L, 1);
+    /* Read spacing before collect_imagefont_glyphs can push the collected
+     * glyph string on top of the stack at index 3. */
+    double spacing = luaL_optnumber(L, 3, 0.0);
     int needs_pop = 0;
     const char *glyphs = collect_imagefont_glyphs(L, 2, NULL, &needs_pop);
-    double spacing = luaL_optnumber(L, 3, 0.0);
 
     AromaFont *font = (AromaFont *)lua_newuserdata(L, sizeof(AromaFont));
     memset(font, 0, sizeof(AromaFont));
@@ -640,6 +650,7 @@ static int l_graphics_newImageFont(lua_State *L) {
         lua_remove(L, -2);
     }
 
+    g_state.resource_wait = 1;
     return lua_yieldk(L, 0, 0, l_graphics_newImageFont_cont);
 }
 
@@ -921,8 +932,18 @@ static void report_lua_error(lua_State *L) {
 }
 
 static void script_thread_finish(void) {
-    if (g_state.script_thread_ref != LUA_NOREF && g_state.L) {
-        luaL_unref(g_state.L, LUA_REGISTRYINDEX, g_state.script_thread_ref);
+    lua_State *T = g_state.script_thread;
+    if (g_state.L && T) {
+        /* A thread that ended LUA_OK can host the next entry point; errored
+         * and abandoned-suspended threads are dead in Lua 5.2 and must be
+         * dropped. The idle ref keeps the cached thread anchored. */
+        if (lua_status(T) == LUA_OK && !g_state.idle_thread) {
+            lua_settop(T, 0);
+            g_state.idle_thread = T;
+            g_state.idle_thread_ref = g_state.script_thread_ref;
+        } else if (g_state.script_thread_ref != LUA_NOREF) {
+            luaL_unref(g_state.L, LUA_REGISTRYINDEX, g_state.script_thread_ref);
+        }
     }
     g_state.script_thread_ref = LUA_NOREF;
     g_state.script_thread = NULL;
@@ -931,11 +952,15 @@ static void script_thread_finish(void) {
 
 static int script_thread_run(int nargs) {
     lua_State *T = g_state.script_thread;
+    g_state.resource_wait = 0;
     int status = lua_resume(T, NULL, nargs);
     if (status == LUA_YIELD) {
-        return status; /* suspended on a resource load; the completion callback resumes */
-    }
-    if (status != LUA_OK) {
+        if (g_state.resource_wait) {
+            return status; /* suspended on a resource load; the completion callback resumes */
+        }
+        fprintf(stderr, "Lua error: script yielded outside of a resource load\n");
+        status = LUA_ERRRUN;
+    } else if (status != LUA_OK) {
         report_lua_error(T);
     }
     script_thread_finish();
@@ -949,8 +974,16 @@ static lua_State *script_thread_begin(ScriptEntryPoint entry_point) {
     if (!g_state.L || g_state.script_thread) {
         return NULL;
     }
-    lua_State *T = lua_newthread(g_state.L);
-    g_state.script_thread_ref = luaL_ref(g_state.L, LUA_REGISTRYINDEX);
+    lua_State *T;
+    if (g_state.idle_thread) {
+        T = g_state.idle_thread;
+        g_state.script_thread_ref = g_state.idle_thread_ref;
+        g_state.idle_thread = NULL;
+        g_state.idle_thread_ref = LUA_NOREF;
+    } else {
+        T = lua_newthread(g_state.L);
+        g_state.script_thread_ref = luaL_ref(g_state.L, LUA_REGISTRYINDEX);
+    }
     g_state.script_thread = T;
     g_state.script_entry_point = entry_point;
     return T;
@@ -967,8 +1000,14 @@ static void resume_resource_wait(void) {
     g_state.discard_rendering = 0;
 }
 
+/* Callbacks resolve through the global each call so scripts that reassign
+ * aroma/love wholesale still get their handlers found. */
 static int push_aroma_callback(lua_State *T, const char *name) {
-    lua_rawgeti(T, LUA_REGISTRYINDEX, g_state.aroma_ref);
+    lua_getglobal(T, "aroma");
+    if (!lua_istable(T, -1)) {
+        lua_pop(T, 1);
+        return 0;
+    }
     lua_getfield(T, -1, name);
     lua_remove(T, -2);
     if (!lua_isfunction(T, -1)) {
@@ -979,7 +1018,6 @@ static int push_aroma_callback(lua_State *T, const char *name) {
 }
 
 static void call_aroma_update(float dt) {
-    if (g_state.aroma_ref == LUA_NOREF) return;
     lua_State *T = script_thread_begin(SCRIPT_ENTRY_UPDATE);
     if (!T) return;
     if (!push_aroma_callback(T, "update")) {
@@ -991,7 +1029,6 @@ static void call_aroma_update(float dt) {
 }
 
 static void call_aroma_draw(void) {
-    if (g_state.aroma_ref == LUA_NOREF) return;
     lua_State *T = script_thread_begin(SCRIPT_ENTRY_DRAW);
     if (!T) return;
     if (!push_aroma_callback(T, "draw")) {
@@ -1002,7 +1039,6 @@ static void call_aroma_draw(void) {
 }
 
 static void call_aroma_key_event(const char *name, const char *key) {
-    if (g_state.aroma_ref == LUA_NOREF) return;
     lua_State *T = script_thread_begin(SCRIPT_ENTRY_KEY_EVENT);
     if (!T) return;
     if (!push_aroma_callback(T, name)) {
@@ -1221,11 +1257,13 @@ EMSCRIPTEN_KEEPALIVE int run_lua_code(const char *code) {
     if (g_state.L) {
         lua_close(g_state.L);
         g_state.L = NULL;
-        g_state.aroma_ref = LUA_NOREF;
         g_state.script_thread = NULL;
         g_state.script_thread_ref = LUA_NOREF;
+        g_state.idle_thread = NULL;
+        g_state.idle_thread_ref = LUA_NOREF;
         g_state.script_entry_point = SCRIPT_ENTRY_NONE;
         g_state.discard_rendering = 0;
+        g_state.resource_wait = 0;
         g_state.current_font = NULL;
     }
 
@@ -1237,9 +1275,6 @@ EMSCRIPTEN_KEEPALIVE int run_lua_code(const char *code) {
 
     luaL_openlibs(g_state.L);
     register_aroma_api(g_state.L);
-
-    lua_getglobal(g_state.L, "aroma");
-    g_state.aroma_ref = luaL_ref(g_state.L, LUA_REGISTRYINDEX);
 
     lua_State *T = script_thread_begin(SCRIPT_ENTRY_BOOTSTRAP);
     if (luaL_loadstring(T, bootstrap_source) != LUA_OK ||
@@ -1269,8 +1304,8 @@ int main(void) {
     g_state.draw_color[1] = 1.0f;
     g_state.draw_color[2] = 1.0f;
     g_state.draw_color[3] = 1.0f;
-    g_state.aroma_ref = LUA_NOREF;
     g_state.script_thread_ref = LUA_NOREF;
+    g_state.idle_thread_ref = LUA_NOREF;
 
     if (!init_webgl()) {
         return 1;
