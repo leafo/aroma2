@@ -41,6 +41,14 @@ typedef struct {
     int loaded;
 } AromaFont;
 
+typedef enum {
+    SCRIPT_ENTRY_NONE,
+    SCRIPT_ENTRY_BOOTSTRAP,
+    SCRIPT_ENTRY_UPDATE,
+    SCRIPT_ENTRY_DRAW,
+    SCRIPT_ENTRY_KEY_EVENT
+} ScriptEntryPoint;
+
 typedef struct {
     lua_State *L;
     int aroma_ref;
@@ -61,6 +69,18 @@ typedef struct {
     int canvas_width;
     int canvas_height;
     AromaFont *current_font;
+    /* Guards async load completions against a Lua state that was closed and
+     * recreated while the load was in flight. */
+    int generation;
+    /* Coroutine the current script entry point (chunk, load, update, draw,
+     * key events) runs on; non-NULL while suspended on a resource load. */
+    lua_State *script_thread;
+    int script_thread_ref;
+    ScriptEntryPoint script_entry_point;
+    /* A draw that resumes from an async load is only being drained so Lua can
+     * reach the next load/completion. The next animation frame renders a fresh
+     * pass after the coroutine finishes. */
+    int discard_rendering;
 } EngineState;
 
 static EngineState g_state;
@@ -141,13 +161,13 @@ static void mat3_scale(Mat3 *m, float sx, float sy) {
     mat3_multiply(m, m, &s);
 }
 
-EM_JS(void, js_request_texture_load, (uintptr_t image_ptr, const char *path), {
+EM_JS(void, js_request_texture_load, (int generation, uintptr_t image_ptr, const char *path), {
   if (Module.requestTextureLoad) {
     const url = UTF8ToString(path);
-    Module.requestTextureLoad(image_ptr, url);
+    Module.requestTextureLoad(generation, image_ptr, url);
   } else {
     console.error('Module.requestTextureLoad is not defined');
-    Module._aroma_image_loaded(image_ptr, 0, 0, 0);
+    Module._aroma_image_loaded(generation, image_ptr, 0, 0, 0);
   }
 });
 
@@ -167,26 +187,16 @@ EM_JS(int, js_is_key_down, (const char *key), {
   return 0;
 });
 
-EM_JS(void, js_request_font_load, (uintptr_t font_ptr, const char *path, const char *glyphs_str, double extra_spacing), {
+EM_JS(void, js_request_font_load, (int generation, uintptr_t font_ptr, const char *path, const char *glyphs_str, double extra_spacing), {
   if (Module.requestFontLoad) {
     const url = UTF8ToString(path);
     const glyphs = UTF8ToString(glyphs_str);
-    Module.requestFontLoad(font_ptr, url, glyphs, extra_spacing);
+    Module.requestFontLoad(generation, font_ptr, url, glyphs, extra_spacing);
   } else {
     console.error('Module.requestFontLoad is not defined');
+    Module._aroma_font_set_glyphs(generation, font_ptr, 0, 0, 0, 0);
   }
 });
-
-EMSCRIPTEN_KEEPALIVE void aroma_image_loaded(uintptr_t image_ptr, int texture_id, int width, int height) {
-    AromaImage *img = (AromaImage *)image_ptr;
-    if (!img) {
-        return;
-    }
-    img->texture_id = texture_id;
-    img->width = width;
-    img->height = height;
-    img->loaded = texture_id != 0;
-}
 
 // UTF-8 decoder for print function
 static uint32_t utf8_decode(const char **str) {
@@ -309,6 +319,11 @@ static int l_graphics_polygon(lua_State *L) {
         coords[i * 2 + 1] = (float)luaL_checknumber(L, 3 + i * 2);
     }
 
+    if (g_state.discard_rendering) {
+        free(coords);
+        return 0;
+    }
+
     glUseProgram(g_state.program);
     glUniformMatrix3fv(g_state.transform_loc, 1, GL_FALSE, current_matrix()->m);
     glUniformMatrix3fv(g_state.projection_loc, 1, GL_FALSE, g_state.projection);
@@ -330,18 +345,28 @@ static int l_graphics_polygon(lua_State *L) {
     return 0;
 }
 
+static int l_graphics_newImage_cont(lua_State *L) {
+    AromaImage *img = (AromaImage *)lua_touserdata(L, lua_gettop(L));
+    if (!img || !img->loaded) {
+        return luaL_error(L, "failed to load image: %s", luaL_checkstring(L, 1));
+    }
+    return 1;
+}
+
 static int l_graphics_newImage(lua_State *L) {
     const char *path = luaL_checkstring(L, 1);
 
     AromaImage *img = (AromaImage *)lua_newuserdata(L, sizeof(AromaImage));
     memset(img, 0, sizeof(AromaImage));
-    img->loaded = 0;
-
-    js_request_texture_load((uintptr_t)img, path);
 
     luaL_getmetatable(L, "aroma.image");
     lua_setmetatable(L, -2);
-    return 1;
+
+    js_request_texture_load(g_state.generation, (uintptr_t)img, path);
+
+    /* Suspend until the async load completes; aroma_image_loaded resumes the
+     * thread and the continuation returns the ready image. */
+    return lua_yieldk(L, 0, 0, l_graphics_newImage_cont);
 }
 
 static const char *collect_imagefont_glyphs(lua_State *L, int idx, size_t *length_out, int *needs_pop) {
@@ -440,6 +465,10 @@ static int l_graphics_draw(lua_State *L) {
         return 0;
     }
 
+    if (g_state.discard_rendering) {
+        return 0;
+    }
+
 
 
     Mat3 base;
@@ -519,6 +548,14 @@ static int l_graphics_rectangle(lua_State *L) {
     float w = (float)luaL_checknumber(L, 4);
     float h = (float)luaL_checknumber(L, 5);
 
+    if (strcmp(mode, "fill") != 0 && strcmp(mode, "line") != 0) {
+        return luaL_error(L, "love.graphics.rectangle: mode must be 'fill' or 'line'");
+    }
+
+    if (g_state.discard_rendering) {
+        return 0;
+    }
+
     // Create 5 vertices for the rectangle (last point closes the loop)
     float coords[10] = {
         x, y,
@@ -547,8 +584,6 @@ static int l_graphics_rectangle(lua_State *L) {
         glDrawArrays(GL_TRIANGLE_FAN, 0, 5);
     } else if (strcmp(mode, "line") == 0) {
         glDrawArrays(GL_LINE_STRIP, 0, 5);
-    } else {
-        return luaL_error(L, "love.graphics.rectangle: mode must be 'fill' or 'line'");
     }
 
     return 0;
@@ -576,6 +611,14 @@ static int l_image_gc(lua_State *L) {
     return 0;
 }
 
+static int l_graphics_newImageFont_cont(lua_State *L) {
+    AromaFont *font = (AromaFont *)lua_touserdata(L, lua_gettop(L));
+    if (!font || !font->loaded) {
+        return luaL_error(L, "failed to load image font: %s", luaL_checkstring(L, 1));
+    }
+    return 1;
+}
+
 static int l_graphics_newImageFont(lua_State *L) {
     const char *path = luaL_checkstring(L, 1);
     int needs_pop = 0;
@@ -585,18 +628,19 @@ static int l_graphics_newImageFont(lua_State *L) {
     AromaFont *font = (AromaFont *)lua_newuserdata(L, sizeof(AromaFont));
     memset(font, 0, sizeof(AromaFont));
     font->extra_spacing = (float)spacing;
-    font->line_height = 0.0f;
-    font->loaded = 0;
-
-    js_request_font_load((uintptr_t)font, path, glyphs, spacing);
-
-    if (needs_pop) {
-        lua_pop(L, 1);
-    }
 
     luaL_getmetatable(L, "aroma.font");
     lua_setmetatable(L, -2);
-    return 1;
+
+    /* glyphs may point into the collected string below the userdata; the JS
+     * bridge copies it during this call, so it can be removed right after. */
+    js_request_font_load(g_state.generation, (uintptr_t)font, path, glyphs, spacing);
+
+    if (needs_pop) {
+        lua_remove(L, -2);
+    }
+
+    return lua_yieldk(L, 0, 0, l_graphics_newImageFont_cont);
 }
 
 static int l_graphics_setFont(lua_State *L) {
@@ -620,6 +664,10 @@ static int l_graphics_print(lua_State *L) {
         return 0;
     }
 
+    if (g_state.discard_rendering) {
+        return 0;
+    }
+
     GlyphInfo *fallback = find_glyph(font, (uint32_t)'?');
     int drawable_count = count_printable_glyphs(font, text, fallback != NULL);
     if (drawable_count <= 0) {
@@ -632,16 +680,8 @@ static int l_graphics_print(lua_State *L) {
     }
 
     float inv_width = font->image_width > 0 ? 1.0f / font->image_width : 0.0f;
-    float inv_height = font->image_height > 0 ? 1.0f / font->image_height : 0.0f;
-    float glyph_height_px = font->image_height > 1 ? (float)(font->image_height - 1) : (float)font->image_height;
+    float glyph_height_px = font->image_height > 0 ? (float)font->image_height : 1.0f;
     float line_height = font->line_height > 0.0f ? font->line_height : glyph_height_px;
-
-    if (glyph_height_px <= 0.0f) {
-        glyph_height_px = 1.0f;
-    }
-    if (line_height <= 0.0f) {
-        line_height = glyph_height_px;
-    }
 
     float cursor_x = x;
     float cursor_y = y;
@@ -681,7 +721,7 @@ static int l_graphics_print(lua_State *L) {
 
         float advance = (float)glyph->width + font->extra_spacing;
 
-        if (glyph->width > 0 && inv_width > 0.0f && inv_height >= 0.0f) {
+        if (glyph->width > 0 && inv_width > 0.0f) {
             float x1 = cursor_x;
             float x2 = cursor_x + (float)glyph->width;
             float y1 = cursor_y;
@@ -689,8 +729,8 @@ static int l_graphics_print(lua_State *L) {
 
             float u1 = glyph->x * inv_width;
             float u2 = (glyph->x + glyph->width) * inv_width;
-            float v1 = font->image_height > 1 ? inv_height : 0.0f;
-            float v2 = font->image_height > 0 ? 1.0f : 0.0f;
+            float v1 = 0.0f;
+            float v2 = 1.0f;
 
             vertices[vertex_count++] = x1;
             vertices[vertex_count++] = y1;
@@ -880,51 +920,158 @@ static void report_lua_error(lua_State *L) {
     lua_pop(L, 1);
 }
 
-static void call_aroma_function(const char *name, int nargs, int nresults) {
-    lua_State *L = g_state.L;
-    lua_rawgeti(L, LUA_REGISTRYINDEX, g_state.aroma_ref); /* aroma table */
-    lua_getfield(L, -1, name);
-    if (lua_isfunction(L, -1)) {
-        if (lua_pcall(L, nargs, nresults, 0) != LUA_OK) {
-            report_lua_error(L);
-        }
-    } else {
-        lua_pop(L, 1 + nargs); /* remove non-function and possible args */
-        lua_pop(L, 1); /* aroma table */
+static void script_thread_finish(void) {
+    if (g_state.script_thread_ref != LUA_NOREF && g_state.L) {
+        luaL_unref(g_state.L, LUA_REGISTRYINDEX, g_state.script_thread_ref);
+    }
+    g_state.script_thread_ref = LUA_NOREF;
+    g_state.script_thread = NULL;
+    g_state.script_entry_point = SCRIPT_ENTRY_NONE;
+}
+
+static int script_thread_run(int nargs) {
+    lua_State *T = g_state.script_thread;
+    int status = lua_resume(T, NULL, nargs);
+    if (status == LUA_YIELD) {
+        return status; /* suspended on a resource load; the completion callback resumes */
+    }
+    if (status != LUA_OK) {
+        report_lua_error(T);
+    }
+    script_thread_finish();
+    return status;
+}
+
+/* Returns a fresh coroutine to run a script entry point on, or NULL while the
+ * previous entry point is still suspended on a resource load (callbacks fired
+ * in that window are dropped). */
+static lua_State *script_thread_begin(ScriptEntryPoint entry_point) {
+    if (!g_state.L || g_state.script_thread) {
+        return NULL;
+    }
+    lua_State *T = lua_newthread(g_state.L);
+    g_state.script_thread_ref = luaL_ref(g_state.L, LUA_REGISTRYINDEX);
+    g_state.script_thread = T;
+    g_state.script_entry_point = entry_point;
+    return T;
+}
+
+static void resume_resource_wait(void) {
+    if (!g_state.script_thread) {
         return;
     }
-    lua_pop(L, 1); /* pop aroma table */
+
+    int discard_rendering = g_state.script_entry_point == SCRIPT_ENTRY_DRAW;
+    g_state.discard_rendering = discard_rendering;
+    script_thread_run(0);
+    g_state.discard_rendering = 0;
+}
+
+static int push_aroma_callback(lua_State *T, const char *name) {
+    lua_rawgeti(T, LUA_REGISTRYINDEX, g_state.aroma_ref);
+    lua_getfield(T, -1, name);
+    lua_remove(T, -2);
+    if (!lua_isfunction(T, -1)) {
+        lua_pop(T, 1);
+        return 0;
+    }
+    return 1;
 }
 
 static void call_aroma_update(float dt) {
-    lua_State *L = g_state.L;
-    if (!L || g_state.aroma_ref == LUA_NOREF) return;
-    lua_rawgeti(L, LUA_REGISTRYINDEX, g_state.aroma_ref);
-    lua_getfield(L, -1, "update");
-    if (lua_isfunction(L, -1)) {
-        lua_pushnumber(L, dt);
-        if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
-            report_lua_error(L);
-        }
-    } else {
-        lua_pop(L, 1);
+    if (g_state.aroma_ref == LUA_NOREF) return;
+    lua_State *T = script_thread_begin(SCRIPT_ENTRY_UPDATE);
+    if (!T) return;
+    if (!push_aroma_callback(T, "update")) {
+        script_thread_finish();
+        return;
     }
-    lua_pop(L, 1);
+    lua_pushnumber(T, dt);
+    script_thread_run(1);
 }
 
 static void call_aroma_draw(void) {
-    lua_State *L = g_state.L;
-    if (!L || g_state.aroma_ref == LUA_NOREF) return;
-    lua_rawgeti(L, LUA_REGISTRYINDEX, g_state.aroma_ref);
-    lua_getfield(L, -1, "draw");
-    if (lua_isfunction(L, -1)) {
-        if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
-            report_lua_error(L);
-        }
-    } else {
-        lua_pop(L, 1);
+    if (g_state.aroma_ref == LUA_NOREF) return;
+    lua_State *T = script_thread_begin(SCRIPT_ENTRY_DRAW);
+    if (!T) return;
+    if (!push_aroma_callback(T, "draw")) {
+        script_thread_finish();
+        return;
     }
-    lua_pop(L, 1);
+    script_thread_run(0);
+}
+
+static void call_aroma_key_event(const char *name, const char *key) {
+    if (g_state.aroma_ref == LUA_NOREF) return;
+    lua_State *T = script_thread_begin(SCRIPT_ENTRY_KEY_EVENT);
+    if (!T) return;
+    if (!push_aroma_callback(T, name)) {
+        script_thread_finish();
+        return;
+    }
+    lua_pushstring(T, key);
+    script_thread_run(1);
+}
+
+EMSCRIPTEN_KEEPALIVE void aroma_image_loaded(int generation, uintptr_t image_ptr, int texture_id, int width, int height) {
+    if (generation != g_state.generation || !g_state.L) {
+        /* Load finished after the requesting Lua state was torn down. */
+        if (texture_id) {
+            js_release_texture(texture_id);
+        }
+        return;
+    }
+
+    AromaImage *img = (AromaImage *)image_ptr;
+    img->texture_id = texture_id;
+    img->width = width;
+    img->height = height;
+    img->loaded = texture_id != 0;
+
+    if (g_state.script_thread) {
+        resume_resource_wait();
+    }
+}
+
+static int32_t glyph_staging[MAX_GLYPHS * 3];
+
+EMSCRIPTEN_KEEPALIVE int32_t *get_glyph_buffer(void) {
+    return glyph_staging;
+}
+
+EMSCRIPTEN_KEEPALIVE int aroma_font_max_glyphs(void) {
+    return MAX_GLYPHS;
+}
+
+EMSCRIPTEN_KEEPALIVE void aroma_font_set_glyphs(int generation, uintptr_t font_ptr, int texture_id, int width, int height, int glyph_count) {
+    if (generation != g_state.generation || !g_state.L) {
+        if (texture_id) {
+            js_release_texture(texture_id);
+        }
+        return;
+    }
+
+    AromaFont *font = (AromaFont *)font_ptr;
+    font->texture_id = texture_id;
+    font->image_width = width;
+    font->image_height = height;
+
+    if (glyph_count > MAX_GLYPHS) {
+        glyph_count = MAX_GLYPHS;
+    }
+    font->glyph_count = glyph_count;
+    for (int i = 0; i < glyph_count; i++) {
+        font->glyphs[i].x = glyph_staging[i * 3 + 0];
+        font->glyphs[i].width = glyph_staging[i * 3 + 1];
+        font->glyphs[i].codepoint = (uint32_t)glyph_staging[i * 3 + 2];
+    }
+
+    font->line_height = (float)height;
+    font->loaded = texture_id != 0 && glyph_count > 0;
+
+    if (g_state.script_thread) {
+        resume_resource_wait();
+    }
 }
 
 static GLuint compile_shader(GLenum type, const char *source) {
@@ -1043,7 +1190,17 @@ static void main_loop(void *userdata) {
     float dt = (float)((now - g_state.last_time) * 0.001);
     g_state.last_time = now;
 
+    /* Leave a suspended entry point and its graphics stack untouched.
+     * Resource completions drain independently of requestAnimationFrame. */
+    if (g_state.script_thread) {
+        return;
+    }
+
     call_aroma_update(dt);
+
+    if (g_state.script_thread) {
+        return;
+    }
 
     glClearColor(g_state.bg_color[0], g_state.bg_color[1], g_state.bg_color[2], g_state.bg_color[3]);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -1052,11 +1209,24 @@ static void main_loop(void *userdata) {
     call_aroma_draw();
 }
 
+static const char *bootstrap_source =
+    "local chunk = ...\n"
+    "chunk()\n"
+    "if type(aroma.load) == 'function' then aroma.load() end\n";
+
 EMSCRIPTEN_KEEPALIVE int run_lua_code(const char *code) {
+    /* Invalidate completions of any loads still in flight on the old state */
+    g_state.generation++;
+
     if (g_state.L) {
         lua_close(g_state.L);
         g_state.L = NULL;
         g_state.aroma_ref = LUA_NOREF;
+        g_state.script_thread = NULL;
+        g_state.script_thread_ref = LUA_NOREF;
+        g_state.script_entry_point = SCRIPT_ENTRY_NONE;
+        g_state.discard_rendering = 0;
+        g_state.current_font = NULL;
     }
 
     g_state.L = luaL_newstate();
@@ -1067,58 +1237,29 @@ EMSCRIPTEN_KEEPALIVE int run_lua_code(const char *code) {
 
     luaL_openlibs(g_state.L);
     register_aroma_api(g_state.L);
-    g_state.current_font = NULL;
-
-    if (luaL_loadstring(g_state.L, code) != LUA_OK) {
-        report_lua_error(g_state.L);
-        return 1;
-    }
-
-    if (lua_pcall(g_state.L, 0, 0, 0) != LUA_OK) {
-        report_lua_error(g_state.L);
-        return 1;
-    }
 
     lua_getglobal(g_state.L, "aroma");
     g_state.aroma_ref = luaL_ref(g_state.L, LUA_REGISTRYINDEX);
 
-    call_aroma_function("load", 0, 0);
+    lua_State *T = script_thread_begin(SCRIPT_ENTRY_BOOTSTRAP);
+    if (luaL_loadstring(T, bootstrap_source) != LUA_OK ||
+        luaL_loadstring(T, code) != LUA_OK) {
+        report_lua_error(T);
+        script_thread_finish();
+        return 1;
+    }
 
-    return 0;
+    /* May suspend on resource loads; runs to completion asynchronously */
+    int status = script_thread_run(1);
+    return status == LUA_OK || status == LUA_YIELD ? 0 : 1;
 }
 
 EMSCRIPTEN_KEEPALIVE void aroma_keypressed(const char *key) {
-    lua_State *L = g_state.L;
-    if (!L || g_state.aroma_ref == LUA_NOREF) return;
-
-    lua_rawgeti(L, LUA_REGISTRYINDEX, g_state.aroma_ref);
-    lua_getfield(L, -1, "keypressed");
-    if (lua_isfunction(L, -1)) {
-        lua_pushstring(L, key);
-        if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
-            report_lua_error(L);
-        }
-    } else {
-        lua_pop(L, 1);
-    }
-    lua_pop(L, 1);
+    call_aroma_key_event("keypressed", key);
 }
 
 EMSCRIPTEN_KEEPALIVE void aroma_keyreleased(const char *key) {
-    lua_State *L = g_state.L;
-    if (!L || g_state.aroma_ref == LUA_NOREF) return;
-
-    lua_rawgeti(L, LUA_REGISTRYINDEX, g_state.aroma_ref);
-    lua_getfield(L, -1, "keyreleased");
-    if (lua_isfunction(L, -1)) {
-        lua_pushstring(L, key);
-        if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
-            report_lua_error(L);
-        }
-    } else {
-        lua_pop(L, 1);
-    }
-    lua_pop(L, 1);
+    call_aroma_key_event("keyreleased", key);
 }
 
 int main(void) {
@@ -1129,6 +1270,7 @@ int main(void) {
     g_state.draw_color[2] = 1.0f;
     g_state.draw_color[3] = 1.0f;
     g_state.aroma_ref = LUA_NOREF;
+    g_state.script_thread_ref = LUA_NOREF;
 
     if (!init_webgl()) {
         return 1;

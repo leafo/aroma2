@@ -31,34 +31,32 @@ export async function initAroma(canvas) {
 
   moduleConfig.preRun = moduleConfig.preRun || [];
   moduleConfig.preRun.push((Module) => {
-    Module.requestTextureLoad = (imagePtr, url) => {
-      const attempt = () => {
-        const store = ensureTextureStore(Module);
-        if (!store) {
-          setTimeout(attempt, 0);
-          return;
-        }
-        store
-          .load(url)
-          .then(({ id, width, height }) => {
-            Module._aroma_image_loaded(imagePtr, id, width, height);
-          })
-          .catch((err) => {
-            console.error('Failed to load texture', url, err);
-            Module._aroma_image_loaded(imagePtr, 0, 0, 0);
-          });
-      };
+    async function waitForTextureStore() {
+      let store = ensureTextureStore(Module);
+      while (!store) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        store = ensureTextureStore(Module);
+      }
+      return store;
+    }
 
-      attempt();
+    // Completion callbacks must always fire, even on failure: the Lua
+    // coroutine that requested the load is suspended until it is resumed.
+    Module.requestTextureLoad = (generation, imagePtr, url) => {
+      waitForTextureStore()
+        .then((store) => store.load(url))
+        .then(({ id, width, height }) => {
+          Module._aroma_image_loaded(generation, imagePtr, id, width, height);
+        })
+        .catch((err) => {
+          console.error('Failed to load texture', url, err);
+          Module._aroma_image_loaded(generation, imagePtr, 0, 0, 0);
+        });
     };
 
-    Module.requestFontLoad = async (fontPtr, url, glyphs, _extraSpacing) => {
+    Module.requestFontLoad = async (generation, fontPtr, url, glyphs, _extraSpacing) => {
       try {
-        const store = ensureTextureStore(Module);
-        if (!store) {
-          console.error('Texture store not ready');
-          return;
-        }
+        const store = await waitForTextureStore();
 
         const response = await fetch(url);
         if (!response.ok) {
@@ -106,9 +104,12 @@ export async function initAroma(canvas) {
           ctx.putImageData(imageData, 0, 0);
         }
 
-        const result = store.createFromSource(canvas, { flipY: true });
+        // Unflipped so texture row 0 is the image's top row, matching the
+        // top-down V coordinates used by graphics.print. (Images go through
+        // createImageBitmap, where UNPACK_FLIP_Y_WEBGL is ignored anyway.)
+        const result = store.createFromSource(canvas, { flipY: false });
 
-        const maxGlyphs = Module._aroma_font_max_glyphs ? Module._aroma_font_max_glyphs() : parsedGlyphs.length;
+        const maxGlyphs = Module._aroma_font_max_glyphs();
         const glyphCount = Math.min(parsedGlyphs.length, maxGlyphs);
 
         if (parsedGlyphs.length > glyphCount) {
@@ -124,12 +125,10 @@ export async function initAroma(canvas) {
           glyphArray[i * 3 + 2] = parsedGlyphs[i].codepoint;
         }
 
-        Module._aroma_font_set_glyphs(fontPtr, result.id, result.width, result.height, glyphCount);
+        Module._aroma_font_set_glyphs(generation, fontPtr, result.id, result.width, result.height, glyphCount);
       } catch (err) {
         console.error('Failed to load font', url, err);
-        if (Module._aroma_font_set_glyphs) {
-          Module._aroma_font_set_glyphs(fontPtr, 0, 0, 0, 0);
-        }
+        Module._aroma_font_set_glyphs(generation, fontPtr, 0, 0, 0, 0);
       }
     };
 

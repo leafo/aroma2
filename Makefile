@@ -24,7 +24,7 @@ BUNDLE := $(OUT_DIR)/app.js
 CFLAGS := -O3 -s WASM=1 -s FULL_ES2=1 -s MIN_WEBGL_VERSION=1 -s MAX_WEBGL_VERSION=1 \
           -s ENVIRONMENT=web -s ALLOW_MEMORY_GROWTH=0 -s ASSERTIONS=0 \
           -s MODULARIZE=1 -s EXPORT_ES6=1 -s EXPORT_NAME=wasmAromaModule \
-          -s EXPORTED_RUNTIME_METHODS=ccall,lengthBytesUTF8,stringToUTF8 \
+          -s EXPORTED_RUNTIME_METHODS=ccall,lengthBytesUTF8,stringToUTF8,HEAP32 \
           -I$(LUA_DIR)
 LDFLAGS :=
 
@@ -43,6 +43,7 @@ $(HTML_OUT): $(SHELL_FILE) $(BUNDLE) $(TARGET_JS)
 	cp $(WASM_OUT) $(OUT_DIR)/
 	@if [ -f $(DATA_OUT) ]; then cp $(DATA_OUT) $(OUT_DIR)/; fi
 	cp $(ASSETS) $(OUT_DIR)/
+	cp -r examples $(OUT_DIR)/
 
 js:
 	mkdir -p js
