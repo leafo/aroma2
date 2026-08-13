@@ -1,4 +1,5 @@
 import { initAroma } from './aroma.js';
+import { compileMoonScript } from './moonscript.js';
 
 // Get DOM elements
 const canvas = document.getElementById('canvas');
@@ -10,8 +11,13 @@ if (!canvas) {
   throw new Error('missing #canvas element');
 }
 
+// Language follows the selected example's extension; edits keep the language
+// of whatever example was loaded last
+let currentLanguage = 'lua';
+
 // Load example code from file
 async function loadExample(filename) {
+  currentLanguage = filename.endsWith('.moon') ? 'moon' : 'lua';
   try {
     const response = await fetch(`examples/${filename}`);
     if (!response.ok) {
@@ -35,12 +41,23 @@ exampleSelector.addEventListener('change', (e) => {
 
 // Initialize Aroma and set up UI handlers
 initAroma(canvas).then((aroma) => {
-  const runCode = () => {
-    const code = codeEditor.value;
+  let running = false;
+
+  const runCode = async () => {
+    if (running) return;
+    running = true;
+    runButton.disabled = true;
     try {
+      let code = codeEditor.value;
+      if (currentLanguage === 'moon') {
+        code = await compileMoonScript(code);
+      }
       aroma.runCode(code);
     } catch (err) {
       console.error('Failed to run code:', err);
+    } finally {
+      running = false;
+      runButton.disabled = false;
     }
   };
 

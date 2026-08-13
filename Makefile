@@ -44,7 +44,6 @@ $(HTML_OUT): $(SHELL_FILE) $(BUNDLE) $(TARGET_JS)
 	@if [ -f $(DATA_OUT) ]; then cp $(DATA_OUT) $(OUT_DIR)/; fi
 	cp $(ASSETS) $(OUT_DIR)/
 	cp -r examples $(OUT_DIR)/
-	for f in examples/*.moon; do moonc -o $(OUT_DIR)/examples/$$(basename $${f%.moon}).lua $$f; done
 
 js:
 	mkdir -p js
