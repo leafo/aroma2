@@ -46,7 +46,8 @@ typedef enum {
     SCRIPT_ENTRY_BOOTSTRAP,
     SCRIPT_ENTRY_UPDATE,
     SCRIPT_ENTRY_DRAW,
-    SCRIPT_ENTRY_KEY_EVENT
+    SCRIPT_ENTRY_KEY_EVENT,
+    SCRIPT_ENTRY_FOCUS
 } ScriptEntryPoint;
 
 typedef struct {
@@ -68,6 +69,7 @@ typedef struct {
     int canvas_width;
     int canvas_height;
     AromaFont *current_font;
+    int current_font_ref;
     /* Guards async load completions against a Lua state that was closed and
      * recreated while the load was in flight. */
     int generation;
@@ -233,17 +235,42 @@ static uint32_t utf8_decode(const char **str) {
 }
 
 static void parse_color(lua_State *L, int idx, float out[4]) {
-    int count = lua_gettop(L) - idx + 1;
-    double r = luaL_checknumber(L, idx + 0);
-    double g = luaL_checknumber(L, idx + 1);
-    double b = luaL_checknumber(L, idx + 2);
-    double a = (count >= 4) ? luaL_checknumber(L, idx + 3) : 1.0;
+    double r, g, b, a;
+    int has_alpha;
+
+    if (lua_istable(L, idx)) {
+        int len = (int)lua_rawlen(L, idx);
+        has_alpha = len >= 4;
+        lua_rawgeti(L, idx, 1);
+        lua_rawgeti(L, idx, 2);
+        lua_rawgeti(L, idx, 3);
+        r = luaL_checknumber(L, -3);
+        g = luaL_checknumber(L, -2);
+        b = luaL_checknumber(L, -1);
+        lua_pop(L, 3);
+        a = 1.0;
+        if (has_alpha) {
+            lua_rawgeti(L, idx, 4);
+            a = luaL_checknumber(L, -1);
+            lua_pop(L, 1);
+        }
+    } else {
+        int count = lua_gettop(L) - idx + 1;
+        has_alpha = count >= 4;
+        r = luaL_checknumber(L, idx + 0);
+        g = luaL_checknumber(L, idx + 1);
+        b = luaL_checknumber(L, idx + 2);
+        a = has_alpha ? luaL_checknumber(L, idx + 3) : 1.0;
+    }
 
     if (r > 1.0 || g > 1.0 || b > 1.0 || a > 1.0) {
         r /= 255.0;
         g /= 255.0;
         b /= 255.0;
-        a /= 255.0;
+        /* A defaulted alpha is already opaque in 0..1, only rescale a given one */
+        if (has_alpha) {
+            a /= 255.0;
+        }
     }
 
     out[0] = (float)r;
@@ -267,6 +294,13 @@ static AromaFont *check_font(lua_State *L, int idx) {
 static int l_graphics_setBackgroundColor(lua_State *L) {
     parse_color(L, 1, g_state.bg_color);
     return 0;
+}
+
+static int l_graphics_getColor(lua_State *L) {
+    for (int i = 0; i < 4; i++) {
+        lua_pushnumber(L, g_state.draw_color[i]);
+    }
+    return 4;
 }
 
 static int l_graphics_setColor(lua_State *L) {
@@ -666,12 +700,21 @@ static int l_graphics_newImageFont(lua_State *L) {
 }
 
 static int l_graphics_setFont(lua_State *L) {
+    /* The active font is anchored in the registry so it survives even when
+     * the script drops its last reference to the userdata. */
+    if (g_state.current_font_ref != LUA_NOREF) {
+        luaL_unref(L, LUA_REGISTRYINDEX, g_state.current_font_ref);
+        g_state.current_font_ref = LUA_NOREF;
+    }
+
     if (lua_isnoneornil(L, 1)) {
         g_state.current_font = NULL;
         return 0;
     }
 
     AromaFont *font = check_font(L, 1);
+    lua_pushvalue(L, 1);
+    g_state.current_font_ref = luaL_ref(L, LUA_REGISTRYINDEX);
     g_state.current_font = font;
     return 0;
 }
@@ -878,6 +921,9 @@ static void register_aroma_api(lua_State *L) {
 
     lua_pushcfunction(L, l_graphics_setColor);
     lua_setfield(L, -2, "setColor");
+
+    lua_pushcfunction(L, l_graphics_getColor);
+    lua_setfield(L, -2, "getColor");
 
     lua_pushcfunction(L, l_graphics_push);
     lua_setfield(L, -2, "push");
@@ -1276,6 +1322,7 @@ EMSCRIPTEN_KEEPALIVE int run_lua_code(const char *code) {
         g_state.discard_rendering = 0;
         g_state.resource_wait = 0;
         g_state.current_font = NULL;
+        g_state.current_font_ref = LUA_NOREF;
     }
 
     g_state.L = luaL_newstate();
@@ -1300,6 +1347,17 @@ EMSCRIPTEN_KEEPALIVE int run_lua_code(const char *code) {
     return status == LUA_OK || status == LUA_YIELD ? 0 : 1;
 }
 
+EMSCRIPTEN_KEEPALIVE void aroma_focus(int focused) {
+    lua_State *T = script_thread_begin(SCRIPT_ENTRY_FOCUS);
+    if (!T) return;
+    if (!push_aroma_callback(T, "focus")) {
+        script_thread_finish();
+        return;
+    }
+    lua_pushboolean(T, focused);
+    script_thread_run(1);
+}
+
 EMSCRIPTEN_KEEPALIVE void aroma_keypressed(const char *key) {
     call_aroma_key_event("keypressed", key);
 }
@@ -1317,6 +1375,7 @@ int main(void) {
     g_state.draw_color[3] = 1.0f;
     g_state.script_thread_ref = LUA_NOREF;
     g_state.idle_thread_ref = LUA_NOREF;
+    g_state.current_font_ref = LUA_NOREF;
 
     if (!init_webgl()) {
         return 1;

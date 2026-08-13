@@ -219,7 +219,8 @@ export async function initAroma(canvas) {
       // Common keys
       'Enter': 'return',
       'Escape': 'escape',
-      ' ': 'space',
+      // spacebar falls through to ' ': pre-0.10 love (the compat target) used
+      // " " as the key constant, not "space"
       'Tab': 'tab',
       'Backspace': 'backspace',
       'Delete': 'delete',
@@ -300,12 +301,25 @@ export async function initAroma(canvas) {
     }
   });
 
-  // TODO: handle keyup separately to ensure key up isn't lost during focus change
   canvas.addEventListener('keyup', (e) => {
     const key = mapKeyName(e.key, e.location);
     pressedKeys.delete(key);
     if (Module._aroma_keyreleased) {
       Module.ccall('aroma_keyreleased', null, ['string'], [key]);
+    }
+  });
+
+  canvas.addEventListener('focus', () => {
+    if (Module._aroma_focus) {
+      Module._aroma_focus(1);
+    }
+  });
+
+  canvas.addEventListener('blur', () => {
+    // keyups are lost while unfocused, so don't leave keys stuck down
+    pressedKeys.clear();
+    if (Module._aroma_focus) {
+      Module._aroma_focus(0);
     }
   });
 

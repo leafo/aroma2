@@ -364,5 +364,8 @@ class Game
     _print "score: " .. @score, @board.ox, @board.oy + @board.real_height + 2
 
 aroma.load = ->
+  font = aroma.graphics.newImageFont "font1.png",
+    [[ ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~!"#$%&'()*+,-./0123456789:;<=>?]]
+  aroma.graphics.setFont font
   bind_state Paused Game!
 
