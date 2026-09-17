@@ -320,6 +320,46 @@ export async function initAroma(canvas) {
     }
   });
 
+  // Mouse positions are in canvas pixels, which differ from CSS pixels when
+  // the page scales the canvas
+  function mousePosition(e) {
+    const rect = canvas.getBoundingClientRect();
+    return [
+      Math.floor((e.clientX - rect.left) * canvas.width / (rect.width || 1)),
+      Math.floor((e.clientY - rect.top) * canvas.height / (rect.height || 1)),
+    ];
+  }
+
+  // DOM button index to love's: 1 left, 2 right, 3 middle
+  const mouseButtons = [1, 3, 2];
+  const heldButtons = new Set();
+
+  canvas.addEventListener('mousedown', (e) => {
+    const button = mouseButtons[e.button] || e.button + 1;
+    heldButtons.add(button);
+    const [x, y] = mousePosition(e);
+    Module._aroma_mousebutton(1, x, y, button, e.detail || 1);
+  });
+
+  // On the window so a drag that leaves the canvas still ends, only buttons
+  // that went down on the canvas are reported
+  window.addEventListener('mouseup', (e) => {
+    const button = mouseButtons[e.button] || e.button + 1;
+    if (!heldButtons.delete(button)) return;
+    const [x, y] = mousePosition(e);
+    Module._aroma_mousebutton(0, x, y, button, e.detail || 1);
+  });
+
+  // Moves outside the canvas only count in the middle of a drag
+  window.addEventListener('mousemove', (e) => {
+    if (e.target !== canvas && heldButtons.size === 0) return;
+    const [x, y] = mousePosition(e);
+    Module._aroma_mousemoved(x, y);
+  });
+
+  // Right click belongs to the game
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
   canvas.addEventListener('focus', () => {
     if (Module._aroma_focus) {
       Module._aroma_focus(1);

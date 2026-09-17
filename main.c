@@ -52,6 +52,7 @@ typedef enum {
     SCRIPT_ENTRY_UPDATE,
     SCRIPT_ENTRY_DRAW,
     SCRIPT_ENTRY_KEY_EVENT,
+    SCRIPT_ENTRY_MOUSE_EVENT,
     SCRIPT_ENTRY_FOCUS,
     SCRIPT_ENTRY_QUIT
 } ScriptEntryPoint;
@@ -101,6 +102,12 @@ typedef struct {
     /* Set by resource constructors just before they yield. A yield without it
      * came from user code and has no completion to resume it. */
     int resource_wait;
+    /* Mouse state is pushed in by the page's events so reads from Lua don't
+     * cross into JS. Buttons are a bitmask, love's button n is bit n - 1 */
+    int mouse_x;
+    int mouse_y;
+    unsigned int mouse_buttons;
+    int mouse_hidden;
     /* Off by default like love: held keys send one keypressed */
     int key_repeat;
     /* Set from inside Lua, the state is torn down once the frame unwinds */
@@ -238,6 +245,10 @@ EM_JS(void, js_set_title, (const char *title), {
   } else {
     document.title = text;
   }
+});
+
+EM_JS(void, js_set_cursor_visible, (int visible), {
+  Module.canvas.style.cursor = visible ? "" : "none";
 });
 
 EM_JS(void, js_on_quit, (void), {
@@ -940,6 +951,53 @@ static int l_keyboard_hasKeyRepeat(lua_State *L) {
     return 1;
 }
 
+static int l_mouse_getPosition(lua_State *L) {
+    lua_pushinteger(L, g_state.mouse_x);
+    lua_pushinteger(L, g_state.mouse_y);
+    return 2;
+}
+
+static int l_mouse_getX(lua_State *L) {
+    lua_pushinteger(L, g_state.mouse_x);
+    return 1;
+}
+
+static int l_mouse_getY(lua_State *L) {
+    lua_pushinteger(L, g_state.mouse_y);
+    return 1;
+}
+
+static int l_mouse_isDown(lua_State *L) {
+    int numargs = lua_gettop(L);
+    int down = 0;
+
+    for (int i = 1; i <= numargs; i++) {
+        int button = (int)luaL_checkinteger(L, i);
+        if (button >= 1 && button <= 32 && (g_state.mouse_buttons & (1u << (button - 1)))) {
+            down = 1;
+        }
+    }
+
+    lua_pushboolean(L, down);
+    return 1;
+}
+
+static void set_mouse_visible(int visible) {
+    g_state.mouse_hidden = !visible;
+    js_set_cursor_visible(visible);
+}
+
+static int l_mouse_setVisible(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TBOOLEAN);
+    set_mouse_visible(lua_toboolean(L, 1));
+    return 0;
+}
+
+static int l_mouse_isVisible(lua_State *L) {
+    lua_pushboolean(L, !g_state.mouse_hidden);
+    return 1;
+}
+
 static void setup_projection(float width, float height);
 
 static void set_canvas_size(int width, int height) {
@@ -1406,6 +1464,21 @@ static void register_aroma_api(lua_State *L) {
     lua_setfield(L, -2, "hasKeyRepeat");
     lua_setfield(L, -2, "keyboard"); /* aroma.keyboard = table */
 
+    lua_newtable(L);                /* aroma.mouse */
+    lua_pushcfunction(L, l_mouse_getPosition);
+    lua_setfield(L, -2, "getPosition");
+    lua_pushcfunction(L, l_mouse_getX);
+    lua_setfield(L, -2, "getX");
+    lua_pushcfunction(L, l_mouse_getY);
+    lua_setfield(L, -2, "getY");
+    lua_pushcfunction(L, l_mouse_isDown);
+    lua_setfield(L, -2, "isDown");
+    lua_pushcfunction(L, l_mouse_setVisible);
+    lua_setfield(L, -2, "setVisible");
+    lua_pushcfunction(L, l_mouse_isVisible);
+    lua_setfield(L, -2, "isVisible");
+    lua_setfield(L, -2, "mouse");    /* aroma.mouse = table */
+
     lua_newtable(L);                /* aroma.window */
     lua_pushcfunction(L, l_window_setMode);
     lua_setfield(L, -2, "setMode");
@@ -1823,6 +1896,7 @@ static void close_lua_state(void) {
     g_state.current_font_ref = LUA_NOREF;
     g_state.key_repeat = 0;
     g_state.quit_requested = 0;
+    set_mouse_visible(1);
 }
 
 /* Runs love.quit and returns whether it asked to keep going */
@@ -1910,6 +1984,64 @@ EMSCRIPTEN_KEEPALIVE void aroma_focus(int focused) {
     }
     lua_pushboolean(T, focused);
     script_thread_run(1);
+}
+
+/* x and y are in canvas pixels. The state is kept current even when the
+ * callback has to be dropped behind a suspended entry point */
+EMSCRIPTEN_KEEPALIVE void aroma_mousemoved(int x, int y) {
+    int dx = x - g_state.mouse_x;
+    int dy = y - g_state.mouse_y;
+    g_state.mouse_x = x;
+    g_state.mouse_y = y;
+
+    if (dx == 0 && dy == 0) {
+        return;
+    }
+
+    lua_State *T = script_thread_begin(SCRIPT_ENTRY_MOUSE_EVENT);
+    if (!T) return;
+    if (!push_aroma_callback(T, "mousemoved")) {
+        script_thread_finish();
+        return;
+    }
+    lua_pushinteger(T, x);
+    lua_pushinteger(T, y);
+    lua_pushinteger(T, dx);
+    lua_pushinteger(T, dy);
+    lua_pushboolean(T, 0); /* istouch */
+    script_thread_run(5);
+    finish_quit();
+}
+
+/* button is love's numbering: 1 left, 2 right, 3 middle. presses counts the
+ * clicks of a double or triple click */
+EMSCRIPTEN_KEEPALIVE void aroma_mousebutton(int pressed, int x, int y, int button, int presses) {
+    g_state.mouse_x = x;
+    g_state.mouse_y = y;
+
+    if (button < 1 || button > 32) {
+        return;
+    }
+
+    if (pressed) {
+        g_state.mouse_buttons |= 1u << (button - 1);
+    } else {
+        g_state.mouse_buttons &= ~(1u << (button - 1));
+    }
+
+    lua_State *T = script_thread_begin(SCRIPT_ENTRY_MOUSE_EVENT);
+    if (!T) return;
+    if (!push_aroma_callback(T, pressed ? "mousepressed" : "mousereleased")) {
+        script_thread_finish();
+        return;
+    }
+    lua_pushinteger(T, x);
+    lua_pushinteger(T, y);
+    lua_pushinteger(T, button);
+    lua_pushboolean(T, 0); /* istouch */
+    lua_pushinteger(T, presses);
+    script_thread_run(5);
+    finish_quit();
 }
 
 EMSCRIPTEN_KEEPALIVE void aroma_keypressed(const char *key, int is_repeat) {
