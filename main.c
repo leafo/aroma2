@@ -42,6 +42,7 @@ typedef struct {
     GlyphInfo glyphs[MAX_GLYPHS];
     int glyph_count;
     float extra_spacing;
+    /* Multiple of the font's height that a line advances by */
     float line_height;
     int loaded;
 } AromaFont;
@@ -203,6 +204,22 @@ static void mat3_scale(Mat3 *m, float sx, float sy) {
     s.m[0] = sx;
     s.m[4] = sy;
     mat3_multiply(m, m, &s);
+}
+
+/* The transform love's draw calls take: moved to x, y, turned by r, scaled,
+ * with ox, oy as the point of the object that lands on x, y */
+static void mat3_local(Mat3 *out, const Mat3 *base, float x, float y, float r, float sx, float sy, float ox, float oy) {
+    Mat3 local;
+    mat3_identity(&local);
+    mat3_translate(&local, x, y);
+    if (r != 0.0f) {
+        mat3_rotate(&local, r);
+    }
+    mat3_scale(&local, sx, sy);
+    if (ox != 0.0f || oy != 0.0f) {
+        mat3_translate(&local, -ox, -oy);
+    }
+    mat3_multiply(out, base, &local);
 }
 
 EM_JS(void, js_request_texture_load, (int generation, uintptr_t image_ptr, const char *path), {
@@ -835,28 +852,237 @@ static GlyphInfo *find_glyph(AromaFont *font, uint32_t codepoint) {
     return NULL;
 }
 
-static int count_printable_glyphs(AromaFont *font, const char *text, int has_fallback) {
-    int count = 0;
-    const char *ptr = text;
+/* Glyph drawn for a codepoint, the font's ? stands in for ones it lacks */
+static GlyphInfo *glyph_for(AromaFont *font, uint32_t codepoint) {
+    GlyphInfo *glyph = find_glyph(font, codepoint);
+    return glyph ? glyph : find_glyph(font, (uint32_t)'?');
+}
 
+/* How far a codepoint moves the cursor. Newlines are the caller's business */
+static float glyph_advance(AromaFont *font, uint32_t codepoint) {
+    if (codepoint == '\r' || codepoint == '\n') {
+        return 0.0f;
+    }
+
+    if (codepoint == '\t') {
+        GlyphInfo *space = find_glyph(font, (uint32_t)' ');
+        float advance = space ? (float)space->width + font->extra_spacing : font->image_height * 0.5f;
+        return advance * 4.0f;
+    }
+
+    GlyphInfo *glyph = glyph_for(font, codepoint);
+    return glyph ? (float)glyph->width + font->extra_spacing : 0.0f;
+}
+
+static float font_line_advance(AromaFont *font) {
+    return (float)font->image_height * font->line_height;
+}
+
+/* A line of laid out text, a span of the string it came from. The span keeps
+ * the spaces it was wrapped at, as love's getWrap does, but the width and
+ * space count leave them out so they don't push aligned text off center */
+typedef struct {
+    const char *start;
+    const char *end;
+    float width;
+    int spaces;
+    /* Ended by a newline or the end of the text rather than by wrapping,
+     * justify leaves these alone */
+    int hard_break;
+} TextLine;
+
+static TextLine *g_lines;
+static int g_line_count;
+static int g_line_capacity;
+
+static void add_line(lua_State *L, const char *start, const char *end, int hard_break) {
+    if (g_line_count >= g_line_capacity) {
+        int capacity = g_line_capacity ? g_line_capacity * 2 : 16;
+        TextLine *grown = (TextLine *)realloc(g_lines, sizeof(TextLine) * capacity);
+        if (!grown) {
+            luaL_error(L, "out of memory");
+        }
+        g_lines = grown;
+        g_line_capacity = capacity;
+    }
+
+    TextLine *line = &g_lines[g_line_count++];
+    line->start = start;
+    line->end = end;
+    line->hard_break = hard_break;
+    line->width = 0.0f;
+    line->spaces = 0;
+}
+
+/* Splits text into g_lines at newlines, and when limit isn't negative also
+ * wherever the next word wouldn't fit. A word wider than the limit on its own
+ * is broken where it runs out of room */
+static void layout_text(lua_State *L, AromaFont *font, const char *text, float limit) {
+    g_line_count = 0;
+
+    const char *line_start = text;
+    /* Where the line can be wrapped, the start of the word after the last
+     * space */
+    const char *wrap_resume = NULL;
+    float width = 0.0f;
+
+    const char *ptr = text;
     while (*ptr) {
+        const char *at = ptr;
         uint32_t codepoint = utf8_decode(&ptr);
 
-        if (codepoint == '\n' || codepoint == '\r' || codepoint == '\t') {
+        if (codepoint == '\n') {
+            add_line(L, line_start, at, 1);
+            line_start = ptr;
+            wrap_resume = NULL;
+            width = 0.0f;
             continue;
         }
 
-        if (find_glyph(font, codepoint)) {
-            count++;
-            continue;
+        float advance = glyph_advance(font, codepoint);
+
+        if (codepoint == ' ') {
+            wrap_resume = ptr;
+        } else if (limit >= 0.0f && width + advance > limit && at > line_start) {
+            if (wrap_resume) {
+                add_line(L, line_start, wrap_resume, 0);
+                line_start = wrap_resume;
+            } else {
+                add_line(L, line_start, at, 0);
+                line_start = at;
+            }
+            wrap_resume = NULL;
+
+            /* Measure again what was carried over to the new line */
+            width = 0.0f;
+            const char *carried = line_start;
+            while (carried < at) {
+                width += glyph_advance(font, utf8_decode(&carried));
+            }
         }
 
-        if (has_fallback) {
-            count++;
+        width += advance;
+    }
+
+    add_line(L, line_start, ptr, 1);
+
+    for (int i = 0; i < g_line_count; i++) {
+        TextLine *line = &g_lines[i];
+        const char *visible_end = line->end;
+        while (visible_end > line->start && visible_end[-1] == ' ') {
+            visible_end--;
+        }
+
+        const char *scan = line->start;
+        while (scan < visible_end) {
+            uint32_t codepoint = utf8_decode(&scan);
+            line->width += glyph_advance(font, codepoint);
+            if (codepoint == ' ') {
+                line->spaces++;
+            }
+        }
+    }
+}
+
+typedef enum { ALIGN_LEFT, ALIGN_CENTER, ALIGN_RIGHT, ALIGN_JUSTIFY } TextAlign;
+
+/* Draws g_lines in one call. limit only matters to alignments other than left */
+static void draw_text_lines(lua_State *L, AromaFont *font, const Mat3 *transform, TextAlign align, float limit) {
+    if (g_state.discard_rendering || font->image_width <= 0) {
+        return;
+    }
+
+    int max_glyphs = 0;
+    for (int i = 0; i < g_line_count; i++) {
+        max_glyphs += (int)(g_lines[i].end - g_lines[i].start);
+    }
+    if (max_glyphs == 0) {
+        return;
+    }
+
+    /* Two triangles a glyph, x y u v a vertex */
+    float *vertices = scratch_floats(L, 0, max_glyphs * 6 * 4);
+    int count = 0;
+
+    float inv_width = 1.0f / font->image_width;
+    float height = (float)font->image_height;
+
+    for (int i = 0; i < g_line_count; i++) {
+        TextLine *line = &g_lines[i];
+        float cursor_x = 0.0f;
+        float cursor_y = i * font_line_advance(font);
+        float space_padding = 0.0f;
+
+        switch (align) {
+            case ALIGN_CENTER:
+                /* Whole pixels, half of one would blur a pixel font */
+                cursor_x = floorf((limit - line->width) / 2.0f);
+                break;
+            case ALIGN_RIGHT:
+                cursor_x = limit - line->width;
+                break;
+            case ALIGN_JUSTIFY:
+                if (!line->hard_break && line->spaces > 0 && line->width < limit) {
+                    space_padding = (limit - line->width) / line->spaces;
+                }
+                break;
+            default:
+                break;
+        }
+
+        const char *ptr = line->start;
+        while (ptr < line->end) {
+            uint32_t codepoint = utf8_decode(&ptr);
+            GlyphInfo *glyph = codepoint == '\t' || codepoint == '\r' ? NULL : glyph_for(font, codepoint);
+
+            if (glyph && glyph->width > 0) {
+                float x1 = cursor_x, x2 = cursor_x + (float)glyph->width;
+                float y1 = cursor_y, y2 = cursor_y + height;
+                float u1 = glyph->x * inv_width, u2 = (glyph->x + glyph->width) * inv_width;
+
+                const float quad[6][4] = {
+                    {x1, y1, u1, 0.0f}, {x1, y2, u1, 1.0f}, {x2, y2, u2, 1.0f},
+                    {x1, y1, u1, 0.0f}, {x2, y2, u2, 1.0f}, {x2, y1, u2, 0.0f}
+                };
+                memcpy(&vertices[count * 4], quad, sizeof(quad));
+                count += 6;
+            }
+
+            cursor_x += glyph_advance(font, codepoint);
+            if (codepoint == ' ') {
+                cursor_x += space_padding;
+            }
         }
     }
 
-    return count;
+    if (count == 0) {
+        return;
+    }
+
+    glUseProgram(g_state.program);
+    glUniformMatrix3fv(g_state.transform_loc, 1, GL_FALSE, transform->m);
+    glUniformMatrix3fv(g_state.projection_loc, 1, GL_FALSE, g_state.projection);
+    glUniform4fv(g_state.color_loc, 1, g_state.gfx.draw_color);
+    if (g_state.use_texture_loc >= 0) {
+        glUniform1i(g_state.use_texture_loc, 1);
+    }
+
+    glActiveTexture(GL_TEXTURE0);
+    js_bind_texture(font->texture_id);
+    if (g_state.sampler_loc >= 0) {
+        glUniform1i(g_state.sampler_loc, 0);
+    }
+
+    glBindBuffer(GL_ARRAY_BUFFER, g_state.vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(float) * count * 4, vertices, GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (const void *)0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (const void *)(2 * sizeof(float)));
+
+    glDrawArrays(GL_TRIANGLES, 0, count);
+
+    glDisableVertexAttribArray(1);
 }
 
 static int l_graphics_draw(lua_State *L) {
@@ -879,22 +1105,8 @@ static int l_graphics_draw(lua_State *L) {
 
 
 
-    Mat3 base;
-    mat3_copy(&base, current_matrix());
-
-    Mat3 local;
-    mat3_identity(&local);
-    mat3_translate(&local, x, y);
-    if (r != 0.0f) {
-        mat3_rotate(&local, r);
-    }
-    mat3_scale(&local, sx, sy);
-    if (ox != 0.0f || oy != 0.0f) {
-        mat3_translate(&local, -ox, -oy);
-    }
-
     Mat3 final;
-    mat3_multiply(&final, &base, &local);
+    mat3_local(&final, current_matrix(), x, y, r, sx, sy, ox, oy);
 
     float w = (float)img->width;
     float h = (float)img->height;
@@ -1041,142 +1253,152 @@ static int l_graphics_setFont(lua_State *L) {
     return 0;
 }
 
+static int l_graphics_getFont(lua_State *L) {
+    if (g_state.gfx.font_ref == LUA_NOREF) {
+        lua_pushnil(L);
+    } else {
+        lua_rawgeti(L, LUA_REGISTRYINDEX, g_state.gfx.font_ref);
+    }
+    return 1;
+}
+
+/* There is no built in font yet, text drawn before setFont doesn't show */
+static AromaFont *drawable_font(void) {
+    AromaFont *font = g_state.gfx.font;
+    if (!font || !font->loaded || font->texture_id == 0 || font->glyph_count == 0) {
+        return NULL;
+    }
+    return font;
+}
+
+/* The r, sx, sy, ox, oy that end print and printf, starting at idx */
+static void check_text_transform(lua_State *L, int idx, float x, float y, Mat3 *out) {
+    float r = (float)luaL_optnumber(L, idx, 0.0);
+    float sx = (float)luaL_optnumber(L, idx + 1, 1.0);
+    float sy = (float)luaL_optnumber(L, idx + 2, sx);
+    float ox = (float)luaL_optnumber(L, idx + 3, 0.0);
+    float oy = (float)luaL_optnumber(L, idx + 4, 0.0);
+    mat3_local(out, current_matrix(), x, y, r, sx, sy, ox, oy);
+}
+
+/* print(text, x, y, r, sx, sy, ox, oy) */
 static int l_graphics_print(lua_State *L) {
     const char *text = luaL_checkstring(L, 1);
     float x = (float)luaL_optnumber(L, 2, 0.0);
     float y = (float)luaL_optnumber(L, 3, 0.0);
+    Mat3 transform;
+    check_text_transform(L, 4, x, y, &transform);
 
-    AromaFont *font = g_state.gfx.font;
-    if (!font || !font->loaded || font->texture_id == 0 || font->glyph_count == 0) {
+    AromaFont *font = drawable_font();
+    if (!font) {
         return 0;
     }
 
-    if (g_state.discard_rendering) {
+    layout_text(L, font, text, -1.0f);
+    draw_text_lines(L, font, &transform, ALIGN_LEFT, 0.0f);
+    return 0;
+}
+
+/* printf(text, x, y, limit, align, r, sx, sy, ox, oy) */
+static int l_graphics_printf(lua_State *L) {
+    static const char *const aligns[] = {"left", "center", "right", "justify", NULL};
+
+    const char *text = luaL_checkstring(L, 1);
+    float x = (float)luaL_checknumber(L, 2);
+    float y = (float)luaL_checknumber(L, 3);
+    float limit = (float)luaL_checknumber(L, 4);
+    TextAlign align = (TextAlign)luaL_checkoption(L, 5, "left", aligns);
+    Mat3 transform;
+    check_text_transform(L, 6, x, y, &transform);
+
+    AromaFont *font = drawable_font();
+    if (!font) {
         return 0;
     }
 
-    GlyphInfo *fallback = find_glyph(font, (uint32_t)'?');
-    int drawable_count = count_printable_glyphs(font, text, fallback != NULL);
-    if (drawable_count <= 0) {
-        return 0;
-    }
+    layout_text(L, font, text, limit < 0.0f ? 0.0f : limit);
+    draw_text_lines(L, font, &transform, align, limit);
+    return 0;
+}
 
-    float *vertices = (float *)malloc(sizeof(float) * drawable_count * 4 * 4);
-    if (!vertices) {
-        return luaL_error(L, "love.graphics.print: out of memory");
-    }
+/* Width of the widest line */
+static int l_font_getWidth(lua_State *L) {
+    AromaFont *font = check_font(L, 1);
+    const char *text = luaL_checkstring(L, 2);
 
-    float inv_width = font->image_width > 0 ? 1.0f / font->image_width : 0.0f;
-    float glyph_height_px = font->image_height > 0 ? (float)font->image_height : 1.0f;
-    float line_height = font->line_height > 0.0f ? font->line_height : glyph_height_px;
-
-    float cursor_x = x;
-    float cursor_y = y;
-    const float base_x = x;
-
-    const char *ptr = text;
-    int vertex_count = 0;
-
-    while (*ptr) {
-        uint32_t codepoint = utf8_decode(&ptr);
-
+    /* Trailing spaces count here, unlike in a laid out line */
+    float widest = 0.0f, width = 0.0f;
+    while (*text) {
+        uint32_t codepoint = utf8_decode(&text);
         if (codepoint == '\n') {
-            cursor_x = base_x;
-            cursor_y += line_height;
+            width = 0.0f;
             continue;
         }
-
-        if (codepoint == '\r') {
-            cursor_x = base_x;
-            continue;
+        width += glyph_advance(font, codepoint);
+        if (width > widest) {
+            widest = width;
         }
+    }
 
-        if (codepoint == '\t') {
-            GlyphInfo *space = find_glyph(font, (uint32_t)' ');
-            float tab_advance = space ? (float)space->width + font->extra_spacing : line_height * 0.5f;
-            cursor_x += tab_advance * 4.0f;
-            continue;
+    lua_pushnumber(L, widest);
+    return 1;
+}
+
+static int l_font_getHeight(lua_State *L) {
+    lua_pushinteger(L, check_font(L, 1)->image_height);
+    return 1;
+}
+
+static int l_font_getLineHeight(lua_State *L) {
+    lua_pushnumber(L, check_font(L, 1)->line_height);
+    return 1;
+}
+
+static int l_font_setLineHeight(lua_State *L) {
+    check_font(L, 1)->line_height = (float)luaL_checknumber(L, 2);
+    return 0;
+}
+
+/* getWrap(text, limit) returns the widest line and the lines as a table */
+static int l_font_getWrap(lua_State *L) {
+    AromaFont *font = check_font(L, 1);
+    const char *text = luaL_checkstring(L, 2);
+    float limit = (float)luaL_checknumber(L, 3);
+
+    layout_text(L, font, text, limit < 0.0f ? 0.0f : limit);
+
+    float widest = 0.0f;
+    lua_createtable(L, g_line_count, 0);
+    for (int i = 0; i < g_line_count; i++) {
+        TextLine *line = &g_lines[i];
+        if (line->width > widest) {
+            widest = line->width;
         }
+        lua_pushlstring(L, line->start, (size_t)(line->end - line->start));
+        lua_rawseti(L, -2, i + 1);
+    }
 
-        GlyphInfo *glyph = find_glyph(font, codepoint);
-        if (!glyph) {
-            glyph = fallback;
-            if (!glyph) {
-                continue;
+    lua_pushnumber(L, widest);
+    lua_insert(L, -2);
+    return 2;
+}
+
+static int l_font_hasGlyphs(lua_State *L) {
+    AromaFont *font = check_font(L, 1);
+    int nargs = lua_gettop(L);
+
+    for (int i = 2; i <= nargs; i++) {
+        const char *text = luaL_checkstring(L, i);
+        while (*text) {
+            if (!find_glyph(font, utf8_decode(&text))) {
+                lua_pushboolean(L, 0);
+                return 1;
             }
         }
-
-        float advance = (float)glyph->width + font->extra_spacing;
-
-        if (glyph->width > 0 && inv_width > 0.0f) {
-            float x1 = cursor_x;
-            float x2 = cursor_x + (float)glyph->width;
-            float y1 = cursor_y;
-            float y2 = cursor_y + glyph_height_px;
-
-            float u1 = glyph->x * inv_width;
-            float u2 = (glyph->x + glyph->width) * inv_width;
-            float v1 = 0.0f;
-            float v2 = 1.0f;
-
-            vertices[vertex_count++] = x1;
-            vertices[vertex_count++] = y1;
-            vertices[vertex_count++] = u1;
-            vertices[vertex_count++] = v1;
-
-            vertices[vertex_count++] = x1;
-            vertices[vertex_count++] = y2;
-            vertices[vertex_count++] = u1;
-            vertices[vertex_count++] = v2;
-
-            vertices[vertex_count++] = x2;
-            vertices[vertex_count++] = y2;
-            vertices[vertex_count++] = u2;
-            vertices[vertex_count++] = v2;
-
-            vertices[vertex_count++] = x2;
-            vertices[vertex_count++] = y1;
-            vertices[vertex_count++] = u2;
-            vertices[vertex_count++] = v1;
-        }
-
-        cursor_x += advance;
     }
 
-    if (vertex_count > 0) {
-        glUseProgram(g_state.program);
-        glUniformMatrix3fv(g_state.transform_loc, 1, GL_FALSE, current_matrix()->m);
-        glUniformMatrix3fv(g_state.projection_loc, 1, GL_FALSE, g_state.projection);
-        glUniform4fv(g_state.color_loc, 1, g_state.gfx.draw_color);
-        if (g_state.use_texture_loc >= 0) {
-            glUniform1i(g_state.use_texture_loc, 1);
-        }
-
-        glActiveTexture(GL_TEXTURE0);
-        js_bind_texture(font->texture_id);
-        if (g_state.sampler_loc >= 0) {
-            glUniform1i(g_state.sampler_loc, 0);
-        }
-
-        glBindBuffer(GL_ARRAY_BUFFER, g_state.vbo);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(float) * vertex_count, vertices, GL_DYNAMIC_DRAW);
-
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (const void *)0);
-
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (const void *)(2 * sizeof(float)));
-
-        int num_quads = vertex_count / 16;
-        for (int i = 0; i < num_quads; i++) {
-            glDrawArrays(GL_TRIANGLE_FAN, i * 4, 4);
-        }
-
-        glDisableVertexAttribArray(1);
-    }
-
-    free(vertices);
-    return 0;
+    lua_pushboolean(L, 1);
+    return 1;
 }
 
 static int l_font_gc(lua_State *L) {
@@ -1653,6 +1875,18 @@ static void register_aroma_api(lua_State *L) {
         lua_setfield(L, -2, "__gc");
 
         lua_newtable(L);
+        lua_pushcfunction(L, l_font_getWidth);
+        lua_setfield(L, -2, "getWidth");
+        lua_pushcfunction(L, l_font_getHeight);
+        lua_setfield(L, -2, "getHeight");
+        lua_pushcfunction(L, l_font_getLineHeight);
+        lua_setfield(L, -2, "getLineHeight");
+        lua_pushcfunction(L, l_font_setLineHeight);
+        lua_setfield(L, -2, "setLineHeight");
+        lua_pushcfunction(L, l_font_getWrap);
+        lua_setfield(L, -2, "getWrap");
+        lua_pushcfunction(L, l_font_hasGlyphs);
+        lua_setfield(L, -2, "hasGlyphs");
         lua_setfield(L, -2, "__index");
     }
     lua_pop(L, 1);
@@ -1749,8 +1983,14 @@ static void register_aroma_api(lua_State *L) {
     lua_pushcfunction(L, l_graphics_setFont);
     lua_setfield(L, -2, "setFont");
 
+    lua_pushcfunction(L, l_graphics_getFont);
+    lua_setfield(L, -2, "getFont");
+
     lua_pushcfunction(L, l_graphics_print);
     lua_setfield(L, -2, "print");
+
+    lua_pushcfunction(L, l_graphics_printf);
+    lua_setfield(L, -2, "printf");
 
     lua_setfield(L, -2, "graphics"); /* aroma.graphics = table */
 
@@ -2018,7 +2258,7 @@ EMSCRIPTEN_KEEPALIVE void aroma_font_set_glyphs(int generation, uintptr_t font_p
         font->glyphs[i].codepoint = (uint32_t)glyph_staging[i * 3 + 2];
     }
 
-    font->line_height = (float)height;
+    font->line_height = 1.0f;
     font->loaded = texture_id != 0 && glyph_count > 0;
 
     if (g_state.script_thread) {

@@ -185,4 +185,13 @@ function love.draw()
     love.mouse.isVisible() and "shown" or "hidden",
     seed), 12, 52)
   g.print("last event: " .. last_event, 12, h - 28)
+
+  -- printf aligns inside a box, and getWidth says how wide text will be
+  local label = "right aligned, wrapped by printf to a 160 pixel box"
+  g.setColor(1, 1, 1, 0.15)
+  g.rectangle("fill", w - 172, 12, 160, font:getHeight() * 3)
+  g.setColor(1, 1, 1)
+  g.printf(label, w - 172, 12, 160, "right")
+  local tag = "pivot"
+  g.print(tag, mx, my - 24, math.sin(spin) * 0.5, 1, 1, font:getWidth(tag) / 2, font:getHeight() / 2)
 end
