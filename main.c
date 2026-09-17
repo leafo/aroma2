@@ -45,6 +45,14 @@ typedef struct {
     TextureParams params;
 } AromaImage;
 
+/* Pixels on the C side, RGBA bytes with the top row first. Scripts build
+ * images in these and hand them to newImage */
+typedef struct {
+    int width;
+    int height;
+    unsigned char *pixels;
+} AromaImageData;
+
 /* A rectangle of a texture, sw and sh being the size of the texture it was
  * measured against */
 typedef struct {
@@ -262,6 +270,10 @@ EM_JS(void, js_request_texture_load, (int generation, uintptr_t image_ptr, const
 
 EM_JS(void, js_bind_texture, (int texture_id), {
   Module.bindTexture(texture_id);
+});
+
+EM_JS(int, js_create_texture_from_pixels, (const unsigned char *pixels, int width, int height), {
+  return Module.createTextureFromPixels(HEAPU8.subarray(pixels, pixels + width * height * 4), width, height);
 });
 
 EM_JS(void, js_set_texture_params, (int texture_id, int min_nearest, int mag_nearest, int wrap_h, int wrap_v), {
@@ -887,7 +899,211 @@ static void check_load_context(lua_State *L, const char *what) {
     }
 }
 
+static AromaImageData *check_image_data(lua_State *L, int idx) {
+    AromaImageData *data = (AromaImageData *)luaL_checkudata(L, idx, "aroma.image_data");
+    if (!data->pixels) {
+        luaL_error(L, "ImageData has been released");
+    }
+    return data;
+}
+
+static int l_image_newImageData(lua_State *L) {
+    if (lua_type(L, 1) == LUA_TSTRING) {
+        return luaL_error(L, "love.image.newImageData: loading from a file isn't supported yet");
+    }
+
+    int width = (int)luaL_checkinteger(L, 1);
+    int height = (int)luaL_checkinteger(L, 2);
+    luaL_argcheck(L, width > 0, 1, "width must be positive");
+    luaL_argcheck(L, height > 0, 2, "height must be positive");
+
+    AromaImageData *data = (AromaImageData *)lua_newuserdata(L, sizeof(AromaImageData));
+    data->width = width;
+    data->height = height;
+    /* Transparent black, like love */
+    data->pixels = (unsigned char *)calloc((size_t)width * height, 4);
+    if (!data->pixels) {
+        return luaL_error(L, "love.image.newImageData: out of memory for %dx%d", width, height);
+    }
+
+    luaL_getmetatable(L, "aroma.image_data");
+    lua_setmetatable(L, -2);
+    return 1;
+}
+
+static unsigned char *check_pixel(lua_State *L, AromaImageData *data, int idx) {
+    int x = (int)floor(luaL_checknumber(L, idx));
+    int y = (int)floor(luaL_checknumber(L, idx + 1));
+    if (x < 0 || y < 0 || x >= data->width || y >= data->height) {
+        luaL_error(L, "pixel (%d, %d) is outside of the %dx%d ImageData", x, y, data->width, data->height);
+    }
+    return &data->pixels[((size_t)y * data->width + x) * 4];
+}
+
+/* Rounds the way love does so the same script gives the same bytes */
+static unsigned char color_to_byte(double value) {
+    if (value <= 0.0) return 0;
+    if (value >= 1.0) return 255;
+    return (unsigned char)(value * 255.0 + 0.5);
+}
+
+/* r, g, b, a from idx on or a table there, alpha defaulting to opaque.
+ * Unlike setColor there is no guessing at a 0..255 range */
+static void read_pixel_color(lua_State *L, int idx, unsigned char *pixel) {
+    if (lua_istable(L, idx)) {
+        for (int i = 0; i < 4; i++) {
+            lua_rawgeti(L, idx, i + 1);
+            pixel[i] = color_to_byte(i == 3 ? luaL_optnumber(L, -1, 1.0) : luaL_checknumber(L, -1));
+            lua_pop(L, 1);
+        }
+        return;
+    }
+
+    for (int i = 0; i < 3; i++) {
+        pixel[i] = color_to_byte(luaL_checknumber(L, idx + i));
+    }
+    pixel[3] = color_to_byte(luaL_optnumber(L, idx + 3, 1.0));
+}
+
+static int l_imagedata_setPixel(lua_State *L) {
+    AromaImageData *data = check_image_data(L, 1);
+    read_pixel_color(L, 4, check_pixel(L, data, 2));
+    return 0;
+}
+
+static int l_imagedata_getPixel(lua_State *L) {
+    AromaImageData *data = check_image_data(L, 1);
+    unsigned char *pixel = check_pixel(L, data, 2);
+    for (int i = 0; i < 4; i++) {
+        lua_pushnumber(L, pixel[i] / 255.0);
+    }
+    return 4;
+}
+
+/* mapPixel(fn, [x, y, w, h]) calls fn(x, y, r, g, b, a) for every pixel of
+ * the region and stores the color it returns */
+static int l_imagedata_mapPixel(lua_State *L) {
+    AromaImageData *data = check_image_data(L, 1);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+    int x0 = (int)luaL_optinteger(L, 3, 0);
+    int y0 = (int)luaL_optinteger(L, 4, 0);
+    int w = (int)luaL_optinteger(L, 5, data->width);
+    int h = (int)luaL_optinteger(L, 6, data->height);
+
+    if (x0 < 0 || y0 < 0 || w < 0 || h < 0 || x0 + w > data->width || y0 + h > data->height) {
+        return luaL_error(L, "mapPixel: region is outside of the %dx%d ImageData", data->width, data->height);
+    }
+
+    for (int y = y0; y < y0 + h; y++) {
+        for (int x = x0; x < x0 + w; x++) {
+            /* Looked up every time, the function may release the ImageData */
+            if (!data->pixels) {
+                return luaL_error(L, "ImageData has been released");
+            }
+            unsigned char *pixel = &data->pixels[((size_t)y * data->width + x) * 4];
+
+            lua_pushvalue(L, 2);
+            lua_pushinteger(L, x);
+            lua_pushinteger(L, y);
+            for (int i = 0; i < 4; i++) {
+                lua_pushnumber(L, pixel[i] / 255.0);
+            }
+            lua_call(L, 6, 4);
+
+            if (!data->pixels) {
+                return luaL_error(L, "ImageData has been released");
+            }
+            read_pixel_color(L, lua_gettop(L) - 3, pixel);
+            lua_pop(L, 4);
+        }
+    }
+    return 0;
+}
+
+/* paste(source, dx, dy, [sx, sy, sw, sh]) copies a region of another
+ * ImageData in, the parts that fall outside of either are left out */
+static int l_imagedata_paste(lua_State *L) {
+    AromaImageData *dst = check_image_data(L, 1);
+    AromaImageData *src = check_image_data(L, 2);
+    int dx = (int)luaL_checkinteger(L, 3);
+    int dy = (int)luaL_checkinteger(L, 4);
+    int sx = (int)luaL_optinteger(L, 5, 0);
+    int sy = (int)luaL_optinteger(L, 6, 0);
+    int sw = (int)luaL_optinteger(L, 7, src->width);
+    int sh = (int)luaL_optinteger(L, 8, src->height);
+
+    if (sx < 0) { sw += sx; dx -= sx; sx = 0; }
+    if (sy < 0) { sh += sy; dy -= sy; sy = 0; }
+    if (dx < 0) { sw += dx; sx -= dx; dx = 0; }
+    if (dy < 0) { sh += dy; sy -= dy; dy = 0; }
+    if (sx + sw > src->width) sw = src->width - sx;
+    if (sy + sh > src->height) sh = src->height - sy;
+    if (dx + sw > dst->width) sw = dst->width - dx;
+    if (dy + sh > dst->height) sh = dst->height - dy;
+
+    for (int row = 0; row < sh; row++) {
+        /* memmove, the source may be the destination */
+        memmove(&dst->pixels[((size_t)(dy + row) * dst->width + dx) * 4],
+                &src->pixels[((size_t)(sy + row) * src->width + sx) * 4],
+                (size_t)(sw > 0 ? sw : 0) * 4);
+    }
+    return 0;
+}
+
+static int l_imagedata_getWidth(lua_State *L) {
+    lua_pushinteger(L, check_image_data(L, 1)->width);
+    return 1;
+}
+
+static int l_imagedata_getHeight(lua_State *L) {
+    lua_pushinteger(L, check_image_data(L, 1)->height);
+    return 1;
+}
+
+static int l_imagedata_getDimensions(lua_State *L) {
+    AromaImageData *data = check_image_data(L, 1);
+    lua_pushinteger(L, data->width);
+    lua_pushinteger(L, data->height);
+    return 2;
+}
+
+/* Also the __gc, so it can't go through check_image_data */
+static int l_imagedata_release(lua_State *L) {
+    AromaImageData *data = (AromaImageData *)luaL_checkudata(L, 1, "aroma.image_data");
+    int had_pixels = data->pixels != NULL;
+    free(data->pixels);
+    data->pixels = NULL;
+    lua_pushboolean(L, had_pixels);
+    return 1;
+}
+
+/* An image made from an ImageData is a copy of it as it is now, and is ready
+ * right away. Only images loaded from a path have to wait */
+static int new_image_from_data(lua_State *L) {
+    AromaImageData *data = check_image_data(L, 1);
+
+    AromaImage *img = (AromaImage *)lua_newuserdata(L, sizeof(AromaImage));
+    memset(img, 0, sizeof(AromaImage));
+    default_texture_params(&img->params);
+    luaL_getmetatable(L, "aroma.image");
+    lua_setmetatable(L, -2);
+
+    img->texture_id = js_create_texture_from_pixels(data->pixels, data->width, data->height);
+    if (!img->texture_id) {
+        return luaL_error(L, "love.graphics.newImage: failed to create a texture");
+    }
+    img->width = data->width;
+    img->height = data->height;
+    img->loaded = 1;
+    apply_texture_params(img->texture_id, &img->params);
+    return 1;
+}
+
 static int l_graphics_newImage(lua_State *L) {
+    if (lua_type(L, 1) == LUA_TUSERDATA) {
+        return new_image_from_data(L);
+    }
+
     const char *path = luaL_checkstring(L, 1);
     check_load_context(L, "love.graphics.newImage");
 
@@ -2134,6 +2350,32 @@ static void register_aroma_api(lua_State *L) {
     }
     lua_pop(L, 1);
 
+    if (luaL_newmetatable(L, "aroma.image_data")) {
+        lua_pushcfunction(L, l_imagedata_release);
+        lua_setfield(L, -2, "__gc");
+
+        lua_newtable(L);
+        lua_pushcfunction(L, l_imagedata_getWidth);
+        lua_setfield(L, -2, "getWidth");
+        lua_pushcfunction(L, l_imagedata_getHeight);
+        lua_setfield(L, -2, "getHeight");
+        lua_pushcfunction(L, l_imagedata_getDimensions);
+        lua_setfield(L, -2, "getDimensions");
+        lua_pushcfunction(L, l_imagedata_getPixel);
+        lua_setfield(L, -2, "getPixel");
+        lua_pushcfunction(L, l_imagedata_setPixel);
+        lua_setfield(L, -2, "setPixel");
+        lua_pushcfunction(L, l_imagedata_mapPixel);
+        lua_setfield(L, -2, "mapPixel");
+        lua_pushcfunction(L, l_imagedata_paste);
+        lua_setfield(L, -2, "paste");
+        lua_pushcfunction(L, l_imagedata_release);
+        lua_setfield(L, -2, "release");
+        register_object_type(L, (const char *const[]){"ImageData", "Data", "Object", NULL});
+        lua_setfield(L, -2, "__index");
+    }
+    lua_pop(L, 1);
+
     if (luaL_newmetatable(L, "aroma.quad")) {
         lua_newtable(L);
         lua_pushcfunction(L, l_quad_getViewport);
@@ -2293,6 +2535,11 @@ static void register_aroma_api(lua_State *L) {
     lua_pushcfunction(L, l_keyboard_hasKeyRepeat);
     lua_setfield(L, -2, "hasKeyRepeat");
     lua_setfield(L, -2, "keyboard"); /* aroma.keyboard = table */
+
+    lua_newtable(L);                /* aroma.image */
+    lua_pushcfunction(L, l_image_newImageData);
+    lua_setfield(L, -2, "newImageData");
+    lua_setfield(L, -2, "image");    /* aroma.image = table */
 
     lua_newtable(L);                /* aroma.mouse */
     lua_pushcfunction(L, l_mouse_getPosition);
