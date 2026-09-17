@@ -65,6 +65,36 @@ typedef struct {
     int looping;
 } AromaSource;
 
+#define MAX_JOYSTICKS 4
+#define MAX_JOYSTICK_BUTTONS 32
+#define MAX_JOYSTICK_AXES 8
+/* One slot of what the page writes each frame: connected, mapped, button
+ * count, axis count, then pressed flags, analog button values and axes */
+#define JOYSTICK_STAGING_FLOATS (4 + MAX_JOYSTICK_BUTTONS * 2 + MAX_JOYSTICK_AXES)
+
+/* A slot of navigator.getGamepads(). The state is diffed against what the
+ * page reports each frame to send love's joystick callbacks */
+typedef struct {
+    int connected;
+    /* The browser's "standard" mapping, which is what makes it a Gamepad */
+    int mapped;
+    /* Tells apart pads that come and go in one slot, a Joystick object is
+     * only live while its id matches */
+    int instance_id;
+    int object_ref;
+    char name[128];
+    int button_count;
+    int axis_count;
+    uint32_t pressed;
+    float values[MAX_JOYSTICK_BUTTONS];
+    float axes[MAX_JOYSTICK_AXES];
+} JoystickSlot;
+
+typedef struct {
+    int slot;
+    int instance_id;
+} AromaJoystick;
+
 #define MESH_VERTEX_FLOATS 8
 
 /* Vertices are x, y, u, v, r, g, b, a. The copy in vertices is what getVertex
@@ -143,6 +173,7 @@ typedef enum {
     SCRIPT_ENTRY_DRAW,
     SCRIPT_ENTRY_KEY_EVENT,
     SCRIPT_ENTRY_MOUSE_EVENT,
+    SCRIPT_ENTRY_JOYSTICK_EVENT,
     SCRIPT_ENTRY_FOCUS,
     SCRIPT_ENTRY_QUIT
 } ScriptEntryPoint;
@@ -198,6 +229,8 @@ typedef struct {
     unsigned int mouse_buttons;
     int mouse_hidden;
     float master_volume;
+    JoystickSlot joysticks[MAX_JOYSTICKS];
+    int next_joystick_instance;
     /* Off by default like love: held keys send one keypressed */
     int key_repeat;
     /* Set from inside Lua, the state is torn down once the frame unwinds */
@@ -206,6 +239,7 @@ typedef struct {
 
 static EngineState g_state;
 
+static void poll_joysticks(void);
 static void apply_render_target(void);
 static void apply_scissor(void);
 static void apply_blend_mode(void);
@@ -323,6 +357,37 @@ EM_JS(void, js_bind_texture, (int texture_id), {
 
 EM_JS(int, js_create_texture_from_pixels, (const unsigned char *pixels, int width, int height), {
   return Module.createTextureFromPixels(HEAPU8.subarray(pixels, pixels + width * height * 4), width, height);
+});
+
+/* Fills the staging buffer from navigator.getGamepads(). Chrome only updates
+ * a pad's state when it's asked for, so this runs every frame */
+EM_JS(void, js_poll_gamepads, (float *staging, int slots, int slot_floats, int max_buttons, int max_axes), {
+  const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+  const out = HEAPF32.subarray(staging >> 2, (staging >> 2) + slots * slot_floats);
+  out.fill(0);
+  for (let slot = 0; slot < slots; slot++) {
+    const pad = pads[slot];
+    if (!pad || !pad.connected) continue;
+    const base = slot * slot_floats;
+    const buttons = Math.min(pad.buttons.length, max_buttons);
+    const axes = Math.min(pad.axes.length, max_axes);
+    out[base] = 1;
+    out[base + 1] = pad.mapping === "standard" ? 1 : 0;
+    out[base + 2] = buttons;
+    out[base + 3] = axes;
+    for (let i = 0; i < buttons; i++) {
+      out[base + 4 + i] = pad.buttons[i].pressed ? 1 : 0;
+      out[base + 4 + max_buttons + i] = pad.buttons[i].value;
+    }
+    for (let i = 0; i < axes; i++) {
+      out[base + 4 + max_buttons * 2 + i] = pad.axes[i];
+    }
+  }
+});
+
+EM_JS(void, js_gamepad_name, (int slot, char *buffer, int size), {
+  const pad = navigator.getGamepads ? navigator.getGamepads()[slot] : null;
+  stringToUTF8(pad ? pad.id : "", buffer, size);
 });
 
 EM_JS(void, js_request_audio_load, (int generation, uintptr_t source_ptr, const char *path), {
@@ -2401,6 +2466,184 @@ static int l_audio_stop(lua_State *L) {
     return 0;
 }
 
+/* The standard mapping's button order. Its triggers, buttons 6 and 7, are
+ * axes in love and have no button name */
+static const char *const gamepad_button_names[] = {
+    "a", "b", "x", "y", "leftshoulder", "rightshoulder", NULL, NULL,
+    "back", "start", "leftstick", "rightstick",
+    "dpup", "dpdown", "dpleft", "dpright", "guide"
+};
+#define GAMEPAD_BUTTON_NAMES ((int)(sizeof(gamepad_button_names) / sizeof(gamepad_button_names[0])))
+
+static const char *const gamepad_axis_names[] = {
+    "leftx", "lefty", "rightx", "righty", "triggerleft", "triggerright", NULL
+};
+#define GAMEPAD_STICK_AXES 4
+#define GAMEPAD_TRIGGER_LEFT_BUTTON 6
+
+static AromaJoystick *check_joystick(lua_State *L, int idx) {
+    return (AromaJoystick *)luaL_checkudata(L, idx, "aroma.joystick");
+}
+
+/* The slot a Joystick reads from, NULL once the pad it stood for is gone.
+ * Every getter answers with zeros then, as love does for a removed joystick */
+static JoystickSlot *live_joystick(lua_State *L, int idx) {
+    AromaJoystick *joystick = check_joystick(L, idx);
+    JoystickSlot *slot = &g_state.joysticks[joystick->slot];
+    return slot->connected && slot->instance_id == joystick->instance_id ? slot : NULL;
+}
+
+static int l_joystick_getJoysticks(lua_State *L) {
+    lua_newtable(L);
+    int count = 0;
+    for (int i = 0; i < MAX_JOYSTICKS; i++) {
+        JoystickSlot *slot = &g_state.joysticks[i];
+        if (slot->connected && slot->object_ref != LUA_NOREF) {
+            lua_rawgeti(L, LUA_REGISTRYINDEX, slot->object_ref);
+            lua_rawseti(L, -2, ++count);
+        }
+    }
+    return 1;
+}
+
+static int l_joystick_getJoystickCount(lua_State *L) {
+    int count = 0;
+    for (int i = 0; i < MAX_JOYSTICKS; i++) {
+        count += g_state.joysticks[i].connected;
+    }
+    lua_pushinteger(L, count);
+    return 1;
+}
+
+/* The browser decides the mapping, there is nothing to set. Says so by
+ * returning false */
+static int l_joystick_setGamepadMapping(lua_State *L) {
+    lua_pushboolean(L, 0);
+    return 1;
+}
+
+static int l_joystick_isConnected(lua_State *L) {
+    lua_pushboolean(L, live_joystick(L, 1) != NULL);
+    return 1;
+}
+
+static int l_joystick_getName(lua_State *L) {
+    JoystickSlot *slot = live_joystick(L, 1);
+    lua_pushstring(L, slot ? slot->name : "");
+    return 1;
+}
+
+static int l_joystick_getID(lua_State *L) {
+    AromaJoystick *joystick = check_joystick(L, 1);
+    lua_pushinteger(L, joystick->slot + 1);
+    if (live_joystick(L, 1)) {
+        lua_pushinteger(L, joystick->instance_id);
+    } else {
+        lua_pushnil(L);
+    }
+    return 2;
+}
+
+static int l_joystick_isGamepad(lua_State *L) {
+    JoystickSlot *slot = live_joystick(L, 1);
+    lua_pushboolean(L, slot && slot->mapped);
+    return 1;
+}
+
+static int l_joystick_getAxisCount(lua_State *L) {
+    JoystickSlot *slot = live_joystick(L, 1);
+    lua_pushinteger(L, slot ? slot->axis_count : 0);
+    return 1;
+}
+
+static int l_joystick_getButtonCount(lua_State *L) {
+    JoystickSlot *slot = live_joystick(L, 1);
+    lua_pushinteger(L, slot ? slot->button_count : 0);
+    return 1;
+}
+
+/* Browsers report a dpad as buttons or axes, never as a hat */
+static int l_joystick_getHatCount(lua_State *L) {
+    check_joystick(L, 1);
+    lua_pushinteger(L, 0);
+    return 1;
+}
+
+static int l_joystick_getHat(lua_State *L) {
+    check_joystick(L, 1);
+    lua_pushliteral(L, "c");
+    return 1;
+}
+
+static int l_joystick_getAxis(lua_State *L) {
+    JoystickSlot *slot = live_joystick(L, 1);
+    int axis = (int)luaL_checkinteger(L, 2);
+    lua_pushnumber(L, slot && axis >= 1 && axis <= slot->axis_count ? slot->axes[axis - 1] : 0.0);
+    return 1;
+}
+
+static int l_joystick_getAxes(lua_State *L) {
+    JoystickSlot *slot = live_joystick(L, 1);
+    int count = slot ? slot->axis_count : 0;
+    luaL_checkstack(L, count, "too many axes");
+    for (int i = 0; i < count; i++) {
+        lua_pushnumber(L, slot->axes[i]);
+    }
+    return count;
+}
+
+/* isDown(button, ...) with raw button numbers from 1 */
+static int l_joystick_isDown(lua_State *L) {
+    JoystickSlot *slot = live_joystick(L, 1);
+    int nargs = lua_gettop(L);
+    int down = 0;
+    for (int i = 2; i <= nargs; i++) {
+        int button = (int)luaL_checkinteger(L, i);
+        if (slot && button >= 1 && button <= slot->button_count && (slot->pressed & (1u << (button - 1)))) {
+            down = 1;
+        }
+    }
+    lua_pushboolean(L, down);
+    return 1;
+}
+
+static int l_joystick_isGamepadDown(lua_State *L) {
+    JoystickSlot *slot = live_joystick(L, 1);
+    int nargs = lua_gettop(L);
+    int down = 0;
+    for (int i = 2; i <= nargs; i++) {
+        const char *name = luaL_checkstring(L, i);
+        int button = -1;
+        for (int b = 0; b < GAMEPAD_BUTTON_NAMES; b++) {
+            if (gamepad_button_names[b] && strcmp(gamepad_button_names[b], name) == 0) {
+                button = b;
+            }
+        }
+        if (button < 0) {
+            return luaL_error(L, "Invalid gamepad button: %s", name);
+        }
+        if (slot && slot->mapped && (slot->pressed & (1u << button))) {
+            down = 1;
+        }
+    }
+    lua_pushboolean(L, down);
+    return 1;
+}
+
+static float gamepad_axis_value(const JoystickSlot *slot, int axis) {
+    if (axis < GAMEPAD_STICK_AXES) {
+        return axis < slot->axis_count ? slot->axes[axis] : 0.0f;
+    }
+    return slot->values[GAMEPAD_TRIGGER_LEFT_BUTTON + axis - GAMEPAD_STICK_AXES];
+}
+
+static int l_joystick_getGamepadAxis(lua_State *L) {
+    JoystickSlot *slot = live_joystick(L, 1);
+    int axis = luaL_checkoption(L, 2, NULL, gamepad_axis_names);
+    lua_pushnumber(L, slot && slot->mapped ? gamepad_axis_value(slot, axis) : 0.0);
+    return 1;
+}
+
 static int l_keyboard_setKeyRepeat(lua_State *L) {
     luaL_checktype(L, 1, LUA_TBOOLEAN);
     g_state.key_repeat = lua_toboolean(L, 1);
@@ -3145,6 +3388,30 @@ static void register_aroma_api(lua_State *L) {
     }
     lua_pop(L, 1);
 
+    if (luaL_newmetatable(L, "aroma.joystick")) {
+        static const luaL_Reg joystick_methods[] = {
+            {"isConnected", l_joystick_isConnected},
+            {"getName", l_joystick_getName},
+            {"getID", l_joystick_getID},
+            {"isGamepad", l_joystick_isGamepad},
+            {"getAxisCount", l_joystick_getAxisCount},
+            {"getButtonCount", l_joystick_getButtonCount},
+            {"getHatCount", l_joystick_getHatCount},
+            {"getHat", l_joystick_getHat},
+            {"getAxis", l_joystick_getAxis},
+            {"getAxes", l_joystick_getAxes},
+            {"isDown", l_joystick_isDown},
+            {"isGamepadDown", l_joystick_isGamepadDown},
+            {"getGamepadAxis", l_joystick_getGamepadAxis},
+            {NULL, NULL}
+        };
+
+        luaL_newlib(L, joystick_methods);
+        register_object_type(L, (const char *const[]){"Joystick", "Object", NULL});
+        lua_setfield(L, -2, "__index");
+    }
+    lua_pop(L, 1);
+
     if (luaL_newmetatable(L, "aroma.source")) {
         static const luaL_Reg source_methods[] = {
             {"clone", l_source_clone},
@@ -3412,6 +3679,15 @@ static void register_aroma_api(lua_State *L) {
     lua_pushcfunction(L, l_keyboard_hasKeyRepeat);
     lua_setfield(L, -2, "hasKeyRepeat");
     lua_setfield(L, -2, "keyboard"); /* aroma.keyboard = table */
+
+    lua_newtable(L);                /* aroma.joystick */
+    lua_pushcfunction(L, l_joystick_getJoysticks);
+    lua_setfield(L, -2, "getJoysticks");
+    lua_pushcfunction(L, l_joystick_getJoystickCount);
+    lua_setfield(L, -2, "getJoystickCount");
+    lua_pushcfunction(L, l_joystick_setGamepadMapping);
+    lua_setfield(L, -2, "setGamepadMapping");
+    lua_setfield(L, -2, "joystick"); /* aroma.joystick = table */
 
     lua_newtable(L);                /* aroma.audio */
     lua_pushcfunction(L, l_audio_newSource);
@@ -3883,6 +4159,11 @@ static void main_loop(void *userdata) {
         return;
     }
 
+    poll_joysticks();
+    if (g_state.script_thread) {
+        return;
+    }
+
     call_aroma_update(dt);
 
     if (finish_quit() || g_state.script_thread) {
@@ -3928,6 +4209,8 @@ static void close_lua_state(void) {
     set_mouse_visible(1);
     g_state.master_volume = 1.0f;
     js_audio_set_master_volume(1.0);
+    /* The next run finds the pads again and gets a joystickadded for each */
+    memset(g_state.joysticks, 0, sizeof(g_state.joysticks));
 }
 
 static int quit_aborted(void) {
@@ -4010,6 +4293,126 @@ EMSCRIPTEN_KEEPALIVE void aroma_focus(int focused) {
     }
     lua_pushboolean(T, focused);
     script_thread_run(1);
+}
+
+/* Calls a joystick callback with the slot's Joystick first. The rest of the
+ * arguments are one string or one number, and for an axis also its value */
+static void call_joystick_event(const char *name, JoystickSlot *slot, const char *string_arg, int number_arg, int has_value, float value) {
+    lua_State *T = script_thread_begin(SCRIPT_ENTRY_JOYSTICK_EVENT);
+    if (!T) return;
+    if (!push_aroma_callback(T, name)) {
+        script_thread_finish();
+        return;
+    }
+
+    int nargs = 1;
+    lua_rawgeti(T, LUA_REGISTRYINDEX, slot->object_ref);
+    if (string_arg) {
+        lua_pushstring(T, string_arg);
+        nargs++;
+    } else if (number_arg > 0) {
+        lua_pushinteger(T, number_arg);
+        nargs++;
+    }
+    if (has_value) {
+        lua_pushnumber(T, value);
+        nargs++;
+    }
+    script_thread_run(nargs);
+    finish_quit();
+}
+
+static float g_joystick_staging[MAX_JOYSTICKS * JOYSTICK_STAGING_FLOATS];
+
+/* Takes in the state of the pads for this frame and sends the callbacks for
+ * what changed. The state is kept current even when a callback has to be
+ * dropped behind a suspended entry point */
+static void poll_joysticks(void) {
+    lua_State *L = g_state.L;
+    if (!L) {
+        return;
+    }
+
+    js_poll_gamepads(g_joystick_staging, MAX_JOYSTICKS, JOYSTICK_STAGING_FLOATS, MAX_JOYSTICK_BUTTONS, MAX_JOYSTICK_AXES);
+
+    for (int i = 0; i < MAX_JOYSTICKS && g_state.L == L; i++) {
+        JoystickSlot *slot = &g_state.joysticks[i];
+        const float *in = &g_joystick_staging[i * JOYSTICK_STAGING_FLOATS];
+        const float *in_pressed = in + 4;
+        const float *in_values = in_pressed + MAX_JOYSTICK_BUTTONS;
+        const float *in_axes = in_values + MAX_JOYSTICK_BUTTONS;
+        int connected = in[0] != 0.0f;
+
+        if (slot->connected && !connected) {
+            slot->connected = 0;
+            call_joystick_event("joystickremoved", slot, NULL, 0, 0, 0.0f);
+            if (g_state.L != L) return;
+            luaL_unref(L, LUA_REGISTRYINDEX, slot->object_ref);
+            slot->object_ref = LUA_NOREF;
+            continue;
+        }
+
+        if (!connected) {
+            continue;
+        }
+
+        if (!slot->connected) {
+            memset(slot, 0, sizeof(JoystickSlot));
+            slot->connected = 1;
+            slot->mapped = in[1] != 0.0f;
+            slot->instance_id = ++g_state.next_joystick_instance;
+            js_gamepad_name(i, slot->name, sizeof(slot->name));
+
+            AromaJoystick *joystick = (AromaJoystick *)lua_newuserdata(L, sizeof(AromaJoystick));
+            joystick->slot = i;
+            joystick->instance_id = slot->instance_id;
+            luaL_getmetatable(L, "aroma.joystick");
+            lua_setmetatable(L, -2);
+            slot->object_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+            slot->button_count = (int)in[2];
+            slot->axis_count = (int)in[3];
+            call_joystick_event("joystickadded", slot, NULL, 0, 0, 0.0f);
+            if (g_state.L != L) return;
+        }
+
+        slot->button_count = (int)in[2];
+        slot->axis_count = (int)in[3];
+
+        for (int a = 0; a < slot->axis_count; a++) {
+            if (slot->axes[a] == in_axes[a]) continue;
+            slot->axes[a] = in_axes[a];
+            call_joystick_event("joystickaxis", slot, NULL, a + 1, 1, in_axes[a]);
+            if (g_state.L != L) return;
+            if (slot->mapped && a < GAMEPAD_STICK_AXES) {
+                call_joystick_event("gamepadaxis", slot, gamepad_axis_names[a], 0, 1, in_axes[a]);
+                if (g_state.L != L) return;
+            }
+        }
+
+        for (int b = 0; b < slot->button_count; b++) {
+            if (slot->values[b] != in_values[b]) {
+                slot->values[b] = in_values[b];
+                int trigger = b - GAMEPAD_TRIGGER_LEFT_BUTTON;
+                if (slot->mapped && (trigger == 0 || trigger == 1)) {
+                    call_joystick_event("gamepadaxis", slot, gamepad_axis_names[GAMEPAD_STICK_AXES + trigger], 0, 1, in_values[b]);
+                    if (g_state.L != L) return;
+                }
+            }
+
+            int pressed = in_pressed[b] != 0.0f;
+            int was_pressed = (slot->pressed >> b) & 1;
+            if (pressed == was_pressed) continue;
+            slot->pressed ^= 1u << b;
+
+            call_joystick_event(pressed ? "joystickpressed" : "joystickreleased", slot, NULL, b + 1, 0, 0.0f);
+            if (g_state.L != L) return;
+            if (slot->mapped && b < GAMEPAD_BUTTON_NAMES && gamepad_button_names[b]) {
+                call_joystick_event(pressed ? "gamepadpressed" : "gamepadreleased", slot, gamepad_button_names[b], 0, 0, 0.0f);
+                if (g_state.L != L) return;
+            }
+        }
+    }
 }
 
 /* x and y are in canvas pixels. The state is kept current even when the

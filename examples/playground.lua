@@ -1,5 +1,5 @@
 -- A tour of the timer, math, window, mouse, keyboard, shape, text, image,
--- canvas and audio APIs.
+-- canvas and audio APIs. gamepad.lua covers gamepads.
 --
 --   mouse      move to aim the arc, the crosshair follows in canvas pixels
 --   click      left drops a dot, right clears them, a double click drops a big one.

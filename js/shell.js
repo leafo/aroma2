@@ -19,7 +19,9 @@ let currentLanguage = 'lua';
 async function loadExample(filename) {
   currentLanguage = filename.endsWith('.moon') ? 'moon' : 'lua';
   try {
-    const response = await fetch(`examples/${filename}`);
+    // Examples change under a static server that sends no cache headers, so
+    // always revalidate rather than let the browser guess at freshness
+    const response = await fetch(`examples/${filename}`, { cache: 'no-cache' });
     if (!response.ok) {
       throw new Error(`Failed to fetch example: ${response.status}`);
     }
