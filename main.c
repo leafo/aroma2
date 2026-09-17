@@ -286,6 +286,7 @@ typedef struct {
     /* Set by the first Lua error. No entry point runs again until the next
      * run, where love would be showing its error screen */
     int errored;
+    double run_started;
 } EngineState;
 
 static EngineState g_state;
@@ -4777,6 +4778,59 @@ static void default_graphics_state(void) {
     apply_blend_mode();
 }
 
+static void fill_rect(float x, float y, float w, float h, float brightness) {
+    float coords[8] = {x, y, x + w, y, x, y + h, x + w, y + h};
+    g_state.gfx.draw_color[0] = g_state.gfx.draw_color[1] = g_state.gfx.draw_color[2] = brightness;
+    g_state.gfx.draw_color[3] = 1.0f;
+
+    Mat3 identity;
+    mat3_identity(&identity);
+    begin_draw(&identity, 0);
+    glDisableVertexAttribArray(1);
+    glVertexAttrib2f(1, 0.0f, 0.0f);
+    glBindBuffer(GL_ARRAY_BUFFER, g_state.vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(coords), coords, GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (const void *)0);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
+/* Shown while a run is still in its chunk or love.load waiting on resources,
+ * a project with many sounds takes seconds to get to its first frame. How
+ * much is left isn't known, so it only shows that something is happening.
+ *
+ * The script is suspended in the middle of whatever it was doing, its
+ * graphics state is put back as it was */
+static void draw_loading_indicator(double now) {
+    /* Most runs are past their loads before anyone would notice */
+    if (now - g_state.run_started < 300.0) {
+        return;
+    }
+
+    GraphicsState saved = g_state.gfx;
+    g_state.gfx.canvas = NULL;
+    g_state.gfx.scissor_enabled = 0;
+    g_state.gfx.blend_mode = BLEND_ALPHA;
+    g_state.gfx.blend_alpha = BLEND_ALPHA_MULTIPLY;
+    apply_render_target();
+    apply_blend_mode();
+
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    const float track = 120.0f, slider = 30.0f, height = 4.0f;
+    float x = floorf((g_state.window_width - track) * 0.5f);
+    float y = floorf((g_state.window_height - height) * 0.5f);
+    float phase = (float)fmod((now - g_state.run_started) / 1200.0, 1.0);
+    float travel = phase < 0.5f ? phase * 2.0f : 2.0f - phase * 2.0f;
+    fill_rect(x, y, track, height, 0.2f);
+    fill_rect(x + floorf((track - slider) * travel), y, slider, height, 0.8f);
+
+    g_state.gfx = saved;
+    apply_render_target();
+    apply_blend_mode();
+}
+
 static void main_loop(void *userdata) {
     (void)userdata;
     double now = emscripten_get_now();
@@ -4797,6 +4851,9 @@ static void main_loop(void *userdata) {
     /* Leave a suspended entry point and its graphics stack untouched.
      * Resource completions drain independently of requestAnimationFrame. */
     if (g_state.script_thread) {
+        if (g_state.script_entry_point == SCRIPT_ENTRY_BOOTSTRAP) {
+            draw_loading_indicator(now);
+        }
         return;
     }
 
@@ -5023,6 +5080,7 @@ static int start_run(const char *bootstrap, const char *code) {
     /* Every run starts somewhere new, scripts that want a fixed run seed it */
     random_set_seed(&g_random, (uint64_t)emscripten_get_now() ^ ((uint64_t)(emscripten_random() * 4294967296.0) << 32));
 
+    g_state.run_started = emscripten_get_now();
     lua_State *T = script_thread_begin(SCRIPT_ENTRY_BOOTSTRAP);
     if (luaL_loadstring(T, bootstrap) != LUA_OK ||
         (code && luaL_loadstring(T, code) != LUA_OK)) {
