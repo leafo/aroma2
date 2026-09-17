@@ -4,6 +4,7 @@
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <math.h>
 #include <stdint.h>
@@ -185,6 +186,35 @@ typedef enum { BLEND_ALPHA_MULTIPLY, BLEND_PREMULTIPLIED } BlendAlphaMode;
 static const char *const blend_mode_names[] = {"alpha", "add", "subtract", "multiply", "replace", "screen", NULL};
 static const char *const blend_alpha_names[] = {"alphamultiply", "premultiplied", NULL};
 
+#define SHADER_MAX_SAMPLERS 7
+
+typedef struct {
+    char name[64];
+    GLenum type;
+    /* Elements when it's an array, otherwise 1 */
+    int size;
+    GLint location;
+    /* Index into samplers for a sampler2D, otherwise -1 */
+    int sampler;
+} ShaderUniform;
+
+/* A program built from love's shader dialect. Textures that were sent are
+ * anchored in the userdata's uservalue by their uniform's name, and sit on
+ * texture unit 1 + their index while the shader draws. Unit 0 is the texture
+ * of the draw itself */
+typedef struct {
+    GLuint program; /* 0 once released */
+    GLint transform_projection_loc;
+    GLint transform_loc;
+    GLint projection_loc;
+    GLint color_loc;
+    GLint screen_size_loc;
+    ShaderUniform *uniforms;
+    int uniform_count;
+    AromaImage *samplers[SHADER_MAX_SAMPLERS];
+    int sampler_count;
+} AromaShader;
+
 /* What push("all") saves next to the transform. The font and canvas are
  * anchored in the registry by their refs for as long as they're in here */
 typedef struct {
@@ -196,6 +226,9 @@ typedef struct {
     /* NULL draws to the window */
     AromaImage *canvas;
     int canvas_ref;
+    /* NULL draws with the built in program */
+    AromaShader *shader;
+    int shader_ref;
     BlendMode blend_mode;
     BlendAlphaMode blend_alpha;
     int scissor_enabled;
@@ -287,6 +320,7 @@ typedef struct {
      * run, where love would be showing its error screen */
     int errored;
     double run_started;
+    int white_texture;
 } EngineState;
 
 static EngineState g_state;
@@ -810,6 +844,10 @@ static int l_graphics_push(lua_State *L) {
             lua_rawgeti(L, LUA_REGISTRYINDEX, g_state.gfx.canvas_ref);
             entry->saved.canvas_ref = luaL_ref(L, LUA_REGISTRYINDEX);
         }
+        if (g_state.gfx.shader_ref != LUA_NOREF) {
+            lua_rawgeti(L, LUA_REGISTRYINDEX, g_state.gfx.shader_ref);
+            entry->saved.shader_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        }
     }
     g_state.stack_top++;
     return 0;
@@ -829,11 +867,19 @@ static void release_canvas_ref(lua_State *L) {
     }
 }
 
+static void release_shader_ref(lua_State *L) {
+    if (g_state.gfx.shader_ref != LUA_NOREF) {
+        luaL_unref(L, LUA_REGISTRYINDEX, g_state.gfx.shader_ref);
+        g_state.gfx.shader_ref = LUA_NOREF;
+    }
+}
+
 static void pop_stack_entry(lua_State *L) {
     StackEntry *entry = &g_state.stack[g_state.stack_top];
     if (entry->has_state) {
         release_font_ref(L);
         release_canvas_ref(L);
+        release_shader_ref(L);
         g_state.gfx = entry->saved;
         entry->has_state = 0;
         apply_render_target();
@@ -878,7 +924,112 @@ static int l_graphics_rotate(lua_State *L) {
 
 /* Sets up the shader for a draw with the current color. texture_id 0 draws
  * untextured */
+/* love's shaders work on 4x4 matrices. z passes through the transform and is
+ * projected like love does it, 10 either side of zero with nearer higher */
+static void mat3_to_mat4(const float *m, float z_scale, float *out) {
+    memset(out, 0, sizeof(float) * 16);
+    out[0] = m[0];
+    out[1] = m[1];
+    out[3] = m[2];
+    out[4] = m[3];
+    out[5] = m[4];
+    out[7] = m[5];
+    out[10] = z_scale;
+    out[12] = m[6];
+    out[13] = m[7];
+    out[15] = m[8];
+}
+
+static void mat4_multiply(const float *a, const float *b, float *out) {
+    for (int col = 0; col < 4; col++) {
+        for (int row = 0; row < 4; row++) {
+            float sum = 0.0f;
+            for (int i = 0; i < 4; i++) {
+                sum += a[i * 4 + row] * b[col * 4 + i];
+            }
+            out[col * 4 + row] = sum;
+        }
+    }
+}
+
+/* An untextured draw under a custom shader samples this, so that Texel comes
+ * out white like it does in love */
+static int white_texture(void) {
+    if (!g_state.white_texture) {
+        static const unsigned char pixel[4] = {255, 255, 255, 255};
+        g_state.white_texture = js_create_texture_from_pixels(pixel, 1, 1);
+    }
+    return g_state.white_texture;
+}
+
+static void begin_shader_draw(AromaShader *shader, const Mat3 *transform, int texture_id) {
+    float transform4[16], projection4[16], combined[16];
+    mat3_to_mat4(transform->m, 1.0f, transform4);
+    mat3_to_mat4(g_state.projection, -0.1f, projection4);
+    mat4_multiply(projection4, transform4, combined);
+
+    glUseProgram(shader->program);
+    if (shader->transform_projection_loc >= 0) {
+        glUniformMatrix4fv(shader->transform_projection_loc, 1, GL_FALSE, combined);
+    }
+    if (shader->transform_loc >= 0) {
+        glUniformMatrix4fv(shader->transform_loc, 1, GL_FALSE, transform4);
+    }
+    if (shader->projection_loc >= 0) {
+        glUniformMatrix4fv(shader->projection_loc, 1, GL_FALSE, projection4);
+    }
+    if (shader->color_loc >= 0) {
+        glUniform4fv(shader->color_loc, 1, g_state.gfx.draw_color);
+    }
+    if (shader->screen_size_loc >= 0) {
+        /* z and w turn gl_FragCoord's y into love's, which counts down from
+         * the top. A canvas is drawn into upside down and already does */
+        AromaImage *canvas = g_state.gfx.canvas;
+        float width = (float)(canvas ? canvas->width : g_state.window_width);
+        float height = (float)(canvas ? canvas->height : g_state.window_height);
+        glUniform4f(shader->screen_size_loc, width, height, canvas ? 1.0f : -1.0f, canvas ? 0.0f : height);
+    }
+
+    for (int i = 0; i < shader->sampler_count; i++) {
+        AromaImage *texture = shader->samplers[i];
+        if (texture && texture->loaded) {
+            glActiveTexture(GL_TEXTURE1 + i);
+            js_bind_texture(texture->texture_id);
+        }
+    }
+    glActiveTexture(GL_TEXTURE0);
+    js_bind_texture(texture_id ? texture_id : white_texture());
+}
+
+/* Everything but meshes reaches a custom shader's position() already
+ * transformed, the way love batches those draws on the CPU. A shader that
+ * works on vertex_position counts on it. Moves the vertices and returns the
+ * transform that is left to apply */
+static const Mat3 *pretransform_for_shader(float *vertices, int count, int stride, const Mat3 *transform) {
+    static Mat3 identity;
+    AromaShader *shader = g_state.gfx.shader;
+    if (!shader || !shader->program) {
+        return transform;
+    }
+
+    const float *m = transform->m;
+    for (int i = 0; i < count; i++) {
+        float *vertex = vertices + i * stride;
+        float x = vertex[0], y = vertex[1];
+        vertex[0] = m[0] * x + m[3] * y + m[6];
+        vertex[1] = m[1] * x + m[4] * y + m[7];
+    }
+    mat3_identity(&identity);
+    return &identity;
+}
+
 static void begin_draw(const Mat3 *transform, int texture_id) {
+    AromaShader *shader = g_state.gfx.shader;
+    if (shader && shader->program) {
+        begin_shader_draw(shader, transform, texture_id);
+        return;
+    }
+
     glUseProgram(g_state.program);
     glUniformMatrix3fv(g_state.transform_loc, 1, GL_FALSE, transform->m);
     glUniformMatrix3fv(g_state.projection_loc, 1, GL_FALSE, g_state.projection);
@@ -913,12 +1064,12 @@ static float *scratch_floats(lua_State *L, int slot, int count) {
     return g_scratch[slot];
 }
 
-static void draw_solid(const float *coords, int points, GLenum mode) {
+static void draw_solid(float *coords, int points, GLenum mode) {
     if (g_state.discard_rendering || points <= 0) {
         return;
     }
 
-    begin_draw(current_matrix(), 0);
+    begin_draw(pretransform_for_shader(coords, points, 2, current_matrix()), 0);
     glDisableVertexAttribArray(1);
     glVertexAttrib2f(1, 0.0f, 0.0f);
 
@@ -1033,7 +1184,7 @@ static int read_points(lua_State *L, int idx, const char *what, float **out) {
 }
 
 /* Filled polygons are drawn as a fan and so have to be convex, as in love */
-static void draw_outline(lua_State *L, int fill, const float *coords, int points) {
+static void draw_outline(lua_State *L, int fill, float *coords, int points) {
     if (fill) {
         draw_solid(coords, points, GL_TRIANGLE_FAN);
     } else {
@@ -1677,7 +1828,7 @@ static void draw_text_lines(lua_State *L, AromaFont *font, const Mat3 *transform
         return;
     }
 
-    begin_draw(transform, font->texture_id);
+    begin_draw(pretransform_for_shader(vertices, count, 4, transform), font->texture_id);
 
     glBindBuffer(GL_ARRAY_BUFFER, g_state.vbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(float) * count * 4, vertices, GL_DYNAMIC_DRAW);
@@ -1749,7 +1900,7 @@ static int l_graphics_draw(lua_State *L) {
         0.0f, h,    u1, v2
     };
 
-    begin_draw(&final, img->texture_id);
+    begin_draw(pretransform_for_shader(vertices, 4, 4, &final), img->texture_id);
 
     glBindBuffer(GL_ARRAY_BUFFER, g_state.vbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_DYNAMIC_DRAW);
@@ -3468,6 +3619,441 @@ static int l_graphics_getBlendMode(lua_State *L) {
     return 2;
 }
 
+/* What love puts around shader code, cut down to GLSL ES 1.0. Uniforms that
+ * both stages declare name their precision, a program whose stages disagree
+ * on one doesn't link */
+static const char *shader_header =
+    "#define number float\n"
+    "#define Image sampler2D\n"
+    "#define extern uniform\n"
+    "#define Texel texture2D\n"
+    "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+    "#define LOVE_HIGHP_OR_MEDIUMP highp\n"
+    "#else\n"
+    "#define LOVE_HIGHP_OR_MEDIUMP mediump\n"
+    "#endif\n"
+    "uniform LOVE_HIGHP_OR_MEDIUMP vec4 love_ScreenSize;\n"
+    "varying LOVE_HIGHP_OR_MEDIUMP vec4 VaryingTexCoord;\n"
+    "varying mediump vec4 VaryingColor;\n";
+
+static const char *vertex_header =
+    "#define VERTEX\n"
+    "precision highp float;\n"
+    "attribute vec4 VertexPosition;\n"
+    "attribute vec4 VertexTexCoord;\n"
+    "attribute vec4 VertexColor;\n"
+    "uniform mat4 TransformMatrix;\n"
+    "uniform mat4 ProjectionMatrix;\n"
+    "uniform mat4 TransformProjectionMatrix;\n"
+    "uniform mediump vec4 ConstantColor;\n";
+
+static const char *vertex_default =
+    "vec4 position(mat4 transform_projection, vec4 vertex_position) {\n"
+    "  return transform_projection * vertex_position;\n"
+    "}\n";
+
+/* The footers open with a newline, the code before them may end in the
+ * middle of a line */
+static const char *vertex_footer =
+    "\nvoid main() {\n"
+    "  VaryingTexCoord = VertexTexCoord;\n"
+    "  VaryingColor = VertexColor * ConstantColor;\n"
+    "  gl_Position = position(TransformProjectionMatrix, VertexPosition);\n"
+    "}\n";
+
+static const char *pixel_header =
+    "#define PIXEL\n"
+    "precision mediump float;\n"
+    "uniform sampler2D MainTex;\n";
+
+static const char *pixel_default =
+    "vec4 effect(vec4 color, Image tex, vec2 texture_coords, vec2 screen_coords) {\n"
+    "  return Texel(tex, texture_coords) * color;\n"
+    "}\n";
+
+static const char *pixel_footer =
+    "\nvoid main() {\n"
+    "  vec2 pixel = vec2(gl_FragCoord.x, gl_FragCoord.y * love_ScreenSize.z + love_ScreenSize.w);\n"
+    "  gl_FragColor = effect(VaryingColor, MainTex, VaryingTexCoord.st, pixel);\n"
+    "}\n";
+
+/* Whether code defines "vec4 name(", which is how love tells a vertex shader
+ * from a pixel shader */
+static int defines_entry_point(const char *code, const char *name) {
+    size_t name_length = strlen(name);
+    for (const char *at = code; (at = strstr(at, "vec4")); at += 4) {
+        const char *rest = at + 4;
+        if (!isspace((unsigned char)*rest)) {
+            continue;
+        }
+        while (isspace((unsigned char)*rest)) {
+            rest++;
+        }
+        if (strncmp(rest, name, name_length) != 0) {
+            continue;
+        }
+        rest += name_length;
+        while (isspace((unsigned char)*rest)) {
+            rest++;
+        }
+        if (*rest == '(') {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Returns 0 with the compiler's log pushed when it doesn't compile */
+static GLuint compile_stage(lua_State *L, GLenum type, const char *code) {
+    int vertex = type == GL_VERTEX_SHADER;
+    const char *sources[5] = {
+        shader_header,
+        vertex ? vertex_header : pixel_header,
+        /* Lines in the log count from the start of the game's own code */
+        "#line 0\n",
+        code ? code : (vertex ? vertex_default : pixel_default),
+        vertex ? vertex_footer : pixel_footer,
+    };
+
+    GLuint stage = glCreateShader(type);
+    glShaderSource(stage, 5, sources, NULL);
+    glCompileShader(stage);
+
+    GLint status = GL_FALSE;
+    glGetShaderiv(stage, GL_COMPILE_STATUS, &status);
+    if (!status) {
+        char info_log[1024];
+        glGetShaderInfoLog(stage, sizeof(info_log), NULL, info_log);
+        glDeleteShader(stage);
+        lua_pushfstring(L, "Cannot compile %s shader code:\n%s", vertex ? "vertex" : "pixel", info_log);
+        return 0;
+    }
+    return stage;
+}
+
+static int is_builtin_uniform(const char *name) {
+    static const char *const names[] = {
+        "love_ScreenSize", "TransformMatrix", "ProjectionMatrix",
+        "TransformProjectionMatrix", "ConstantColor", "MainTex", NULL,
+    };
+    for (int i = 0; names[i]; i++) {
+        if (strcmp(name, names[i]) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void collect_uniforms(AromaShader *shader) {
+    GLint count = 0;
+    glGetProgramiv(shader->program, GL_ACTIVE_UNIFORMS, &count);
+    shader->uniforms = (ShaderUniform *)calloc(count > 0 ? (size_t)count : 1, sizeof(ShaderUniform));
+    if (!shader->uniforms) {
+        return;
+    }
+
+    glUseProgram(shader->program);
+    for (int i = 0; i < count; i++) {
+        ShaderUniform *uniform = &shader->uniforms[shader->uniform_count];
+        GLint size = 0;
+        glGetActiveUniform(shader->program, (GLuint)i, sizeof(uniform->name), NULL, &size, &uniform->type, uniform->name);
+        /* Arrays are listed as name[0] */
+        char *bracket = strchr(uniform->name, '[');
+        if (bracket) {
+            *bracket = '\0';
+        }
+        if (is_builtin_uniform(uniform->name)) {
+            continue;
+        }
+
+        uniform->size = size;
+        uniform->location = glGetUniformLocation(shader->program, uniform->name);
+        uniform->sampler = -1;
+        if (uniform->type == GL_SAMPLER_2D) {
+            if (shader->sampler_count == SHADER_MAX_SAMPLERS) {
+                continue;
+            }
+            uniform->sampler = shader->sampler_count++;
+            glUniform1i(uniform->location, 1 + uniform->sampler);
+        }
+        shader->uniform_count++;
+    }
+}
+
+/* newShader(code) or newShader(pixelcode, vertexcode) in either order. Each
+ * can be the code or the name of a file holding it */
+static int l_graphics_newShader(lua_State *L) {
+    const char *vertex_code = NULL;
+    const char *pixel_code = NULL;
+
+    int nargs = lua_gettop(L) < 2 ? 1 : 2;
+    for (int i = 1; i <= nargs; i++) {
+        if (lua_isnoneornil(L, i)) {
+            continue;
+        }
+        const char *code = luaL_checkstring(L, i);
+        if (!strchr(code, '\n') && push_project_file(L, code)) {
+            lua_replace(L, i);
+            code = lua_tostring(L, i);
+        }
+        int is_vertex = defines_entry_point(code, "position");
+        int is_pixel = defines_entry_point(code, "effect");
+        if (!is_vertex && !is_pixel) {
+            return luaL_error(L, "love.graphics.newShader: the code has neither a 'vec4 position' nor a 'vec4 effect' function");
+        }
+        if (is_vertex) {
+            vertex_code = code;
+        }
+        if (is_pixel) {
+            pixel_code = code;
+        }
+    }
+
+    GLuint vertex = compile_stage(L, GL_VERTEX_SHADER, vertex_code);
+    if (!vertex) {
+        return lua_error(L);
+    }
+    GLuint pixel = compile_stage(L, GL_FRAGMENT_SHADER, pixel_code);
+    if (!pixel) {
+        glDeleteShader(vertex);
+        return lua_error(L);
+    }
+
+    GLuint program = glCreateProgram();
+    glAttachShader(program, vertex);
+    glAttachShader(program, pixel);
+    /* The same slots as the built in program, so every draw feeds either */
+    glBindAttribLocation(program, 0, "VertexPosition");
+    glBindAttribLocation(program, 1, "VertexTexCoord");
+    glBindAttribLocation(program, 2, "VertexColor");
+    glLinkProgram(program);
+    glDeleteShader(vertex);
+    glDeleteShader(pixel);
+
+    GLint status = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &status);
+    if (!status) {
+        char info_log[1024];
+        glGetProgramInfoLog(program, sizeof(info_log), NULL, info_log);
+        glDeleteProgram(program);
+        return luaL_error(L, "Cannot link shader program object:\n%s", info_log);
+    }
+
+    AromaShader *shader = (AromaShader *)lua_newuserdata(L, sizeof(AromaShader));
+    memset(shader, 0, sizeof(AromaShader));
+    luaL_getmetatable(L, "aroma.shader");
+    lua_setmetatable(L, -2);
+    lua_newtable(L);
+    lua_setuservalue(L, -2);
+
+    shader->program = program;
+    shader->transform_projection_loc = glGetUniformLocation(program, "TransformProjectionMatrix");
+    shader->transform_loc = glGetUniformLocation(program, "TransformMatrix");
+    shader->projection_loc = glGetUniformLocation(program, "ProjectionMatrix");
+    shader->color_loc = glGetUniformLocation(program, "ConstantColor");
+    shader->screen_size_loc = glGetUniformLocation(program, "love_ScreenSize");
+    collect_uniforms(shader);
+    /* MainTex is left on unit 0, where a uniform starts out */
+    return 1;
+}
+
+static AromaShader *check_shader(lua_State *L, int idx) {
+    AromaShader *shader = (AromaShader *)luaL_checkudata(L, idx, "aroma.shader");
+    if (!shader->program) {
+        luaL_error(L, "the shader has been released");
+    }
+    return shader;
+}
+
+static ShaderUniform *find_uniform(AromaShader *shader, const char *name) {
+    for (int i = 0; i < shader->uniform_count; i++) {
+        if (strcmp(shader->uniforms[i].name, name) == 0) {
+            return &shader->uniforms[i];
+        }
+    }
+    return NULL;
+}
+
+static int uniform_components(GLenum type) {
+    switch (type) {
+        case GL_FLOAT: case GL_INT: case GL_BOOL: return 1;
+        case GL_FLOAT_VEC2: case GL_INT_VEC2: case GL_BOOL_VEC2: return 2;
+        case GL_FLOAT_VEC3: case GL_INT_VEC3: case GL_BOOL_VEC3: return 3;
+        case GL_FLOAT_VEC4: case GL_INT_VEC4: case GL_BOOL_VEC4: case GL_FLOAT_MAT2: return 4;
+        case GL_FLOAT_MAT3: return 9;
+        case GL_FLOAT_MAT4: return 16;
+        default: return 0;
+    }
+}
+
+/* Reads one value of a uniform from the stack: a number or boolean, a flat
+ * table, or a table of rows */
+static void read_uniform_value(lua_State *L, int idx, const char *name, int components, float *out) {
+    if (!lua_istable(L, idx)) {
+        if (components != 1) {
+            luaL_error(L, "Shader uniform '%s' takes tables of %d numbers", name, components);
+        }
+        out[0] = lua_isboolean(L, idx) ? (float)lua_toboolean(L, idx) : (float)luaL_checknumber(L, idx);
+        return;
+    }
+
+    int filled = 0;
+    int length = (int)lua_rawlen(L, idx);
+    for (int i = 1; i <= length && filled < components; i++) {
+        lua_rawgeti(L, idx, i);
+        if (lua_istable(L, -1)) {
+            int row_length = (int)lua_rawlen(L, -1);
+            for (int j = 1; j <= row_length && filled < components; j++) {
+                lua_rawgeti(L, -1, j);
+                out[filled++] = (float)lua_tonumber(L, -1);
+                lua_pop(L, 1);
+            }
+        } else {
+            out[filled++] = lua_isboolean(L, -1) ? (float)lua_toboolean(L, -1) : (float)lua_tonumber(L, -1);
+        }
+        lua_pop(L, 1);
+    }
+    if (filled < components) {
+        luaL_error(L, "Shader uniform '%s' needs %d numbers, got %d", name, components, filled);
+    }
+}
+
+/* send(name, value, ...) with a value for each element of an array.
+ * Matrices are written in rows like in love unless "column" comes first */
+static int l_shader_send(lua_State *L) {
+    AromaShader *shader = check_shader(L, 1);
+    const char *name = luaL_checkstring(L, 2);
+    ShaderUniform *uniform = find_uniform(shader, name);
+    if (!uniform) {
+        return luaL_error(L, "Shader uniform '%s' does not exist.\nA common error is to define but not use the variable.", name);
+    }
+
+    if (uniform->sampler >= 0) {
+        AromaImage *texture = (AromaImage *)luaL_testudata(L, 3, "aroma.image");
+        if (!texture) {
+            texture = (AromaImage *)luaL_checkudata(L, 3, "aroma.canvas");
+        }
+        shader->samplers[uniform->sampler] = texture;
+        lua_getuservalue(L, 1);
+        lua_pushvalue(L, 3);
+        lua_setfield(L, -2, name);
+        return 0;
+    }
+
+    int components = uniform_components(uniform->type);
+    if (!components) {
+        return luaL_error(L, "Shader uniform '%s' has a type that can't be sent", name);
+    }
+
+    int first = 3;
+    int column_major = 0;
+    int is_matrix = uniform->type == GL_FLOAT_MAT2 || uniform->type == GL_FLOAT_MAT3 || uniform->type == GL_FLOAT_MAT4;
+    if (is_matrix && lua_type(L, 3) == LUA_TSTRING) {
+        static const char *const layouts[] = {"row", "column", NULL};
+        column_major = luaL_checkoption(L, 3, NULL, layouts);
+        first = 4;
+    }
+
+    int count = lua_gettop(L) - first + 1;
+    if (count < 1) {
+        return luaL_error(L, "Shader uniform '%s' needs a value", name);
+    }
+    if (count > uniform->size) {
+        count = uniform->size;
+    }
+
+    float *values = scratch_floats(L, 0, count * components);
+    for (int i = 0; i < count; i++) {
+        float *value = values + i * components;
+        read_uniform_value(L, first + i, name, components, value);
+        if (is_matrix && !column_major) {
+            int n = components == 4 ? 2 : (components == 9 ? 3 : 4);
+            for (int row = 0; row < n; row++) {
+                for (int col = row + 1; col < n; col++) {
+                    float swap = value[row * n + col];
+                    value[row * n + col] = value[col * n + row];
+                    value[col * n + row] = swap;
+                }
+            }
+        }
+    }
+
+    glUseProgram(shader->program);
+    GLint location = uniform->location;
+    switch (uniform->type) {
+        case GL_FLOAT: glUniform1fv(location, count, values); break;
+        case GL_FLOAT_VEC2: glUniform2fv(location, count, values); break;
+        case GL_FLOAT_VEC3: glUniform3fv(location, count, values); break;
+        case GL_FLOAT_VEC4: glUniform4fv(location, count, values); break;
+        case GL_FLOAT_MAT2: glUniformMatrix2fv(location, count, GL_FALSE, values); break;
+        case GL_FLOAT_MAT3: glUniformMatrix3fv(location, count, GL_FALSE, values); break;
+        case GL_FLOAT_MAT4: glUniformMatrix4fv(location, count, GL_FALSE, values); break;
+        default: {
+            /* ints and bools */
+            GLint ints[64];
+            int total = count * components;
+            if (total > 64) {
+                total = 64;
+                count = total / components;
+            }
+            for (int i = 0; i < total; i++) {
+                ints[i] = (GLint)values[i];
+            }
+            if (components == 1) glUniform1iv(location, count, ints);
+            else if (components == 2) glUniform2iv(location, count, ints);
+            else if (components == 3) glUniform3iv(location, count, ints);
+            else glUniform4iv(location, count, ints);
+        }
+    }
+    return 0;
+}
+
+static int l_shader_hasUniform(lua_State *L) {
+    AromaShader *shader = check_shader(L, 1);
+    lua_pushboolean(L, find_uniform(shader, luaL_checkstring(L, 2)) != NULL);
+    return 1;
+}
+
+static int l_shader_getWarnings(lua_State *L) {
+    check_shader(L, 1);
+    lua_pushliteral(L, "");
+    return 1;
+}
+
+/* Also the __gc. Draws fall back to the built in program when the active
+ * shader is released */
+static int l_shader_release(lua_State *L) {
+    AromaShader *shader = (AromaShader *)luaL_checkudata(L, 1, "aroma.shader");
+    int had_program = shader->program != 0;
+    if (had_program) {
+        glDeleteProgram(shader->program);
+        free(shader->uniforms);
+        memset(shader, 0, sizeof(AromaShader));
+    }
+    lua_pushboolean(L, had_program);
+    return 1;
+}
+
+static int l_graphics_setShader(lua_State *L) {
+    AromaShader *shader = lua_isnoneornil(L, 1) ? NULL : check_shader(L, 1);
+    release_shader_ref(L);
+    g_state.gfx.shader = shader;
+    if (shader) {
+        lua_pushvalue(L, 1);
+        g_state.gfx.shader_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    return 0;
+}
+
+static int l_graphics_getShader(lua_State *L) {
+    if (g_state.gfx.shader_ref == LUA_NOREF) {
+        lua_pushnil(L);
+    } else {
+        lua_rawgeti(L, LUA_REGISTRYINDEX, g_state.gfx.shader_ref);
+    }
+    return 1;
+}
+
 static int l_graphics_getCanvasFormats(lua_State *L) {
     lua_newtable(L);
     lua_pushboolean(L, 1);
@@ -4087,6 +4673,24 @@ static void register_aroma_api(lua_State *L) {
     }
     lua_pop(L, 1);
 
+    if (luaL_newmetatable(L, "aroma.shader")) {
+        lua_pushcfunction(L, l_shader_release);
+        lua_setfield(L, -2, "__gc");
+
+        lua_newtable(L);
+        lua_pushcfunction(L, l_shader_send);
+        lua_setfield(L, -2, "send");
+        lua_pushcfunction(L, l_shader_hasUniform);
+        lua_setfield(L, -2, "hasUniform");
+        lua_pushcfunction(L, l_shader_getWarnings);
+        lua_setfield(L, -2, "getWarnings");
+        lua_pushcfunction(L, l_shader_release);
+        lua_setfield(L, -2, "release");
+        register_object_type(L, (const char *const[]){"Shader", "Object", NULL});
+        lua_setfield(L, -2, "__index");
+    }
+    lua_pop(L, 1);
+
     if (luaL_newmetatable(L, "aroma.image_data")) {
         lua_pushcfunction(L, l_imagedata_release);
         lua_setfield(L, -2, "__gc");
@@ -4234,6 +4838,12 @@ static void register_aroma_api(lua_State *L) {
 
     lua_pushcfunction(L, l_graphics_newCanvas);
     lua_setfield(L, -2, "newCanvas");
+    lua_pushcfunction(L, l_graphics_newShader);
+    lua_setfield(L, -2, "newShader");
+    lua_pushcfunction(L, l_graphics_setShader);
+    lua_setfield(L, -2, "setShader");
+    lua_pushcfunction(L, l_graphics_getShader);
+    lua_setfield(L, -2, "getShader");
     lua_pushcfunction(L, l_graphics_getCanvasFormats);
     lua_setfield(L, -2, "getCanvasFormats");
 
@@ -4763,6 +5373,8 @@ static void default_graphics_state(void) {
     gfx->font_ref = LUA_NOREF;
     gfx->canvas = NULL;
     gfx->canvas_ref = LUA_NOREF;
+    gfx->shader = NULL;
+    gfx->shader_ref = LUA_NOREF;
     gfx->blend_mode = BLEND_ALPHA;
     gfx->blend_alpha = BLEND_ALPHA_MULTIPLY;
     gfx->scissor_enabled = 0;
@@ -4809,6 +5421,7 @@ static void draw_loading_indicator(double now) {
 
     GraphicsState saved = g_state.gfx;
     g_state.gfx.canvas = NULL;
+    g_state.gfx.shader = NULL;
     g_state.gfx.scissor_enabled = 0;
     g_state.gfx.blend_mode = BLEND_ALPHA;
     g_state.gfx.blend_alpha = BLEND_ALPHA_MULTIPLY;
