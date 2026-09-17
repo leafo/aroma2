@@ -1,5 +1,6 @@
 import wasmAromaModule from './wasm-aroma.js';
 import { createTextureStore } from './texture-store.js';
+import { createAudioStore } from './audio-store.js';
 
 /**
  * Initialize the Aroma WebAssembly runtime
@@ -51,6 +52,19 @@ export async function initAroma(canvas) {
         .catch((err) => {
           console.error('Failed to load texture', url, err);
           Module._aroma_image_loaded(generation, imagePtr, 0, 0, 0);
+        });
+    };
+
+    Module.audio = createAudioStore();
+
+    Module.requestAudioLoad = (generation, sourcePtr, url) => {
+      Module.audio.load(url)
+        .then(({ id, duration }) => {
+          Module._aroma_source_loaded(generation, sourcePtr, id, duration);
+        })
+        .catch((err) => {
+          console.error('Failed to load audio', url, err);
+          Module._aroma_source_loaded(generation, sourcePtr, 0, 0);
         });
     };
 
@@ -327,6 +341,7 @@ export async function initAroma(canvas) {
   }
 
   canvas.addEventListener('keydown', (e) => {
+    Module.audio.unlock();
     claimKey(e);
     const key = mapKeyName(e.key, e.location);
     pressedKeys.add(key);
@@ -359,6 +374,7 @@ export async function initAroma(canvas) {
   const heldButtons = new Set();
 
   canvas.addEventListener('mousedown', (e) => {
+    Module.audio.unlock();
     const button = mouseButtons[e.button] || e.button + 1;
     heldButtons.add(button);
     const [x, y] = mousePosition(e);

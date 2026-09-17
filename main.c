@@ -55,6 +55,16 @@ typedef struct {
     unsigned char *pixels;
 } AromaImageData;
 
+/* The settings are mirrored here so the getters don't need the page */
+typedef struct {
+    int source_id;
+    int loaded;
+    double duration;
+    float volume;
+    float pitch;
+    int looping;
+} AromaSource;
+
 #define MESH_VERTEX_FLOATS 8
 
 /* Vertices are x, y, u, v, r, g, b, a. The copy in vertices is what getVertex
@@ -187,6 +197,7 @@ typedef struct {
     int mouse_y;
     unsigned int mouse_buttons;
     int mouse_hidden;
+    float master_volume;
     /* Off by default like love: held keys send one keypressed */
     int key_repeat;
     /* Set from inside Lua, the state is torn down once the frame unwinds */
@@ -312,6 +323,62 @@ EM_JS(void, js_bind_texture, (int texture_id), {
 
 EM_JS(int, js_create_texture_from_pixels, (const unsigned char *pixels, int width, int height), {
   return Module.createTextureFromPixels(HEAPU8.subarray(pixels, pixels + width * height * 4), width, height);
+});
+
+EM_JS(void, js_request_audio_load, (int generation, uintptr_t source_ptr, const char *path), {
+  Module.requestAudioLoad(generation, source_ptr, UTF8ToString(path));
+});
+
+EM_JS(int, js_audio_clone, (int source_id), {
+  return Module.audio.clone(source_id);
+});
+
+EM_JS(int, js_audio_play, (int source_id), {
+  return Module.audio.play(source_id) ? 1 : 0;
+});
+
+EM_JS(void, js_audio_pause, (int source_id), {
+  Module.audio.pause(source_id);
+});
+
+EM_JS(void, js_audio_stop, (int source_id), {
+  Module.audio.stop(source_id);
+});
+
+EM_JS(void, js_audio_stop_all, (void), {
+  Module.audio.stopAll();
+});
+
+EM_JS(int, js_audio_is_playing, (int source_id), {
+  return Module.audio.isPlaying(source_id) ? 1 : 0;
+});
+
+EM_JS(double, js_audio_tell, (int source_id), {
+  return Module.audio.tell(source_id);
+});
+
+EM_JS(void, js_audio_seek, (int source_id, double seconds), {
+  Module.audio.seek(source_id, seconds);
+});
+
+EM_JS(void, js_audio_set_volume, (int source_id, double volume), {
+  Module.audio.setVolume(source_id, volume);
+});
+
+EM_JS(void, js_audio_set_pitch, (int source_id, double pitch), {
+  Module.audio.setPitch(source_id, pitch);
+});
+
+EM_JS(void, js_audio_set_looping, (int source_id, int looping), {
+  Module.audio.setLooping(source_id, !!looping);
+});
+
+EM_JS(void, js_audio_release, (int source_id), {
+  Module.audio.release(source_id);
+});
+
+EM_JS(void, js_audio_set_master_volume, (double volume), {
+  Module.audio.setMasterVolume(volume);
 });
 
 EM_JS(int, js_create_canvas, (int width, int height), {
@@ -2159,6 +2226,181 @@ static int l_keyboard_isDown(lua_State *L) {
 }
 
 
+static AromaSource *check_source(lua_State *L, int idx) {
+    AromaSource *source = (AromaSource *)luaL_checkudata(L, idx, "aroma.source");
+    if (!source->source_id) {
+        luaL_error(L, "Source has been released");
+    }
+    return source;
+}
+
+static AromaSource *push_source(lua_State *L) {
+    AromaSource *source = (AromaSource *)lua_newuserdata(L, sizeof(AromaSource));
+    memset(source, 0, sizeof(AromaSource));
+    source->volume = 1.0f;
+    source->pitch = 1.0f;
+    luaL_getmetatable(L, "aroma.source");
+    lua_setmetatable(L, -2);
+    return source;
+}
+
+static int l_audio_newSource_cont(lua_State *L) {
+    AromaSource *source = (AromaSource *)lua_touserdata(L, lua_gettop(L));
+    if (!source || !source->loaded) {
+        return luaL_error(L, "failed to load audio: %s", luaL_checkstring(L, 1));
+    }
+    return 1;
+}
+
+/* newSource(path, type). "stream" sources are decoded whole like "static"
+ * ones, there is no streaming */
+static int l_audio_newSource(lua_State *L) {
+    static const char *const types[] = {"static", "stream", NULL};
+    const char *path = luaL_checkstring(L, 1);
+    luaL_checkoption(L, 2, "static", types);
+    check_load_context(L, "love.audio.newSource");
+
+    AromaSource *source = push_source(L);
+    js_request_audio_load(g_state.generation, (uintptr_t)source, path);
+
+    g_state.resource_wait = 1;
+    return lua_yieldk(L, 0, 0, l_audio_newSource_cont);
+}
+
+static int l_source_clone(lua_State *L) {
+    AromaSource *source = check_source(L, 1);
+    AromaSource *copy = push_source(L);
+    *copy = *source;
+    copy->source_id = js_audio_clone(source->source_id);
+    if (!copy->source_id) {
+        return luaL_error(L, "Source:clone failed");
+    }
+    return 1;
+}
+
+static int l_source_play(lua_State *L) {
+    lua_pushboolean(L, js_audio_play(check_source(L, 1)->source_id));
+    return 1;
+}
+
+static int l_source_pause(lua_State *L) {
+    js_audio_pause(check_source(L, 1)->source_id);
+    return 0;
+}
+
+static int l_source_stop(lua_State *L) {
+    js_audio_stop(check_source(L, 1)->source_id);
+    return 0;
+}
+
+static int l_source_isPlaying(lua_State *L) {
+    lua_pushboolean(L, js_audio_is_playing(check_source(L, 1)->source_id));
+    return 1;
+}
+
+static int l_source_setVolume(lua_State *L) {
+    AromaSource *source = check_source(L, 1);
+    float volume = (float)luaL_checknumber(L, 2);
+    source->volume = volume < 0.0f ? 0.0f : volume > 1.0f ? 1.0f : volume;
+    js_audio_set_volume(source->source_id, source->volume);
+    return 0;
+}
+
+static int l_source_getVolume(lua_State *L) {
+    lua_pushnumber(L, check_source(L, 1)->volume);
+    return 1;
+}
+
+static int l_source_getVolumeLimits(lua_State *L) {
+    check_source(L, 1);
+    lua_pushnumber(L, 0.0);
+    lua_pushnumber(L, 1.0);
+    return 2;
+}
+
+static int l_source_setPitch(lua_State *L) {
+    AromaSource *source = check_source(L, 1);
+    float pitch = (float)luaL_checknumber(L, 2);
+    luaL_argcheck(L, pitch > 0.0f, 2, "pitch has to be greater than 0");
+    source->pitch = pitch;
+    js_audio_set_pitch(source->source_id, pitch);
+    return 0;
+}
+
+static int l_source_getPitch(lua_State *L) {
+    lua_pushnumber(L, check_source(L, 1)->pitch);
+    return 1;
+}
+
+static int l_source_setLooping(lua_State *L) {
+    AromaSource *source = check_source(L, 1);
+    luaL_checktype(L, 2, LUA_TBOOLEAN);
+    source->looping = lua_toboolean(L, 2);
+    js_audio_set_looping(source->source_id, source->looping);
+    return 0;
+}
+
+static int l_source_isLooping(lua_State *L) {
+    lua_pushboolean(L, check_source(L, 1)->looping);
+    return 1;
+}
+
+/* Positions are in seconds, love's "samples" unit isn't supported */
+static int l_source_seek(lua_State *L) {
+    AromaSource *source = check_source(L, 1);
+    double seconds = luaL_checknumber(L, 2);
+    luaL_argcheck(L, seconds >= 0.0, 2, "can't seek to a negative position");
+    js_audio_seek(source->source_id, seconds);
+    return 0;
+}
+
+static int l_source_tell(lua_State *L) {
+    lua_pushnumber(L, js_audio_tell(check_source(L, 1)->source_id));
+    return 1;
+}
+
+static int l_source_getDuration(lua_State *L) {
+    lua_pushnumber(L, check_source(L, 1)->duration);
+    return 1;
+}
+
+/* Also the __gc */
+static int l_source_release(lua_State *L) {
+    AromaSource *source = (AromaSource *)luaL_checkudata(L, 1, "aroma.source");
+    int had_source = source->source_id != 0;
+    if (had_source) {
+        js_audio_release(source->source_id);
+        source->source_id = 0;
+    }
+    lua_pushboolean(L, had_source);
+    return 1;
+}
+
+static int l_audio_setVolume(lua_State *L) {
+    float volume = (float)luaL_checknumber(L, 1);
+    g_state.master_volume = volume < 0.0f ? 0.0f : volume;
+    js_audio_set_master_volume(g_state.master_volume);
+    return 0;
+}
+
+static int l_audio_getVolume(lua_State *L) {
+    lua_pushnumber(L, g_state.master_volume);
+    return 1;
+}
+
+/* stop() for every source, or stop(source, ...) */
+static int l_audio_stop(lua_State *L) {
+    int nargs = lua_gettop(L);
+    if (nargs == 0) {
+        js_audio_stop_all();
+        return 0;
+    }
+    for (int i = 1; i <= nargs; i++) {
+        js_audio_stop(check_source(L, i)->source_id);
+    }
+    return 0;
+}
+
 static int l_keyboard_setKeyRepeat(lua_State *L) {
     luaL_checktype(L, 1, LUA_TBOOLEAN);
     g_state.key_repeat = lua_toboolean(L, 1);
@@ -2903,6 +3145,36 @@ static void register_aroma_api(lua_State *L) {
     }
     lua_pop(L, 1);
 
+    if (luaL_newmetatable(L, "aroma.source")) {
+        static const luaL_Reg source_methods[] = {
+            {"clone", l_source_clone},
+            {"play", l_source_play},
+            {"pause", l_source_pause},
+            {"stop", l_source_stop},
+            {"isPlaying", l_source_isPlaying},
+            {"setVolume", l_source_setVolume},
+            {"getVolume", l_source_getVolume},
+            {"getVolumeLimits", l_source_getVolumeLimits},
+            {"setPitch", l_source_setPitch},
+            {"getPitch", l_source_getPitch},
+            {"setLooping", l_source_setLooping},
+            {"isLooping", l_source_isLooping},
+            {"seek", l_source_seek},
+            {"tell", l_source_tell},
+            {"getDuration", l_source_getDuration},
+            {"release", l_source_release},
+            {NULL, NULL}
+        };
+
+        lua_pushcfunction(L, l_source_release);
+        lua_setfield(L, -2, "__gc");
+
+        luaL_newlib(L, source_methods);
+        register_object_type(L, (const char *const[]){"Source", "Object", NULL});
+        lua_setfield(L, -2, "__index");
+    }
+    lua_pop(L, 1);
+
     if (luaL_newmetatable(L, "aroma.mesh")) {
         lua_pushcfunction(L, l_mesh_release);
         lua_setfield(L, -2, "__gc");
@@ -3141,6 +3413,17 @@ static void register_aroma_api(lua_State *L) {
     lua_setfield(L, -2, "hasKeyRepeat");
     lua_setfield(L, -2, "keyboard"); /* aroma.keyboard = table */
 
+    lua_newtable(L);                /* aroma.audio */
+    lua_pushcfunction(L, l_audio_newSource);
+    lua_setfield(L, -2, "newSource");
+    lua_pushcfunction(L, l_audio_setVolume);
+    lua_setfield(L, -2, "setVolume");
+    lua_pushcfunction(L, l_audio_getVolume);
+    lua_setfield(L, -2, "getVolume");
+    lua_pushcfunction(L, l_audio_stop);
+    lua_setfield(L, -2, "stop");
+    lua_setfield(L, -2, "audio");    /* aroma.audio = table */
+
     lua_newtable(L);                /* aroma.image */
     lua_pushcfunction(L, l_image_newImageData);
     lua_setfield(L, -2, "newImageData");
@@ -3346,6 +3629,24 @@ static void call_aroma_key_event(const char *name, const char *key, int is_repea
     }
     script_thread_run(nargs);
     finish_quit();
+}
+
+EMSCRIPTEN_KEEPALIVE void aroma_source_loaded(int generation, uintptr_t source_ptr, int source_id, double duration) {
+    if (generation != g_state.generation || !g_state.L) {
+        if (source_id) {
+            js_audio_release(source_id);
+        }
+        return;
+    }
+
+    AromaSource *source = (AromaSource *)source_ptr;
+    source->source_id = source_id;
+    source->duration = duration;
+    source->loaded = source_id != 0;
+
+    if (g_state.script_thread) {
+        resume_resource_wait();
+    }
 }
 
 EMSCRIPTEN_KEEPALIVE void aroma_image_loaded(int generation, uintptr_t image_ptr, int texture_id, int width, int height) {
@@ -3625,6 +3926,8 @@ static void close_lua_state(void) {
     g_state.key_repeat = 0;
     g_state.quit_requested = 0;
     set_mouse_visible(1);
+    g_state.master_volume = 1.0f;
+    js_audio_set_master_volume(1.0);
 }
 
 static int quit_aborted(void) {
@@ -3781,6 +4084,7 @@ EMSCRIPTEN_KEEPALIVE void aroma_keyreleased(const char *key) {
 int main(void) {
     memset(&g_state, 0, sizeof(g_state));
     default_graphics_state();
+    g_state.master_volume = 1.0f;
     g_state.script_thread_ref = LUA_NOREF;
     g_state.idle_thread_ref = LUA_NOREF;
 

@@ -1,8 +1,10 @@
--- A tour of the timer, math, window, mouse, keyboard, shape, text, image and
--- canvas APIs.
+-- A tour of the timer, math, window, mouse, keyboard, shape, text, image,
+-- canvas and audio APIs.
 --
 --   mouse      move to aim the arc, the crosshair follows in canvas pixels
---   click      left drops a dot, right clears them, a double click drops a big one
+--   click      left drops a dot, right clears them, a double click drops a big one.
+--              each dot blips a step higher up a pentatonic scale
+--   l          toggle a low looping drone
 --   drag       hold a button and leave the canvas, the release still arrives
 --   up / down  line width (hold to repeat once r has turned key repeat on)
 --   r          toggle key repeat
@@ -20,7 +22,10 @@ local font
 local image, image_quad
 local pixel_canvas
 local shards, shatter_time
-local shatter
+local shatter, play_blip
+local blip, drone
+local voices = {}
+local PENTATONIC = {0, 2, 4, 7, 9}
 local seed = 1
 local terrain = {}
 local dots = {}
@@ -55,6 +60,12 @@ function love.load()
   -- game renders at its design size and scales up
   pixel_canvas = g.newCanvas(96, 64)
   pixel_canvas:setFilter("nearest", "nearest")
+
+  blip = love.audio.newSource("blip.wav", "static")
+  drone = blip:clone()
+  drone:setLooping(true)
+  drone:setPitch(0.25)
+  drone:setVolume(0.3)
   love.window.setTitle("aroma playground")
   build_terrain()
 end
@@ -91,6 +102,8 @@ function love.keypressed(key, scancode, isrepeat)
     end
   elseif key == "f" and not isrepeat then
     image:setFilter(image:getFilter() == "linear" and "nearest" or "linear")
+  elseif key == "l" and not isrepeat then
+    if drone:isPlaying() then drone:stop() else drone:play() end
   elseif key == "m" and not isrepeat then
     shatter()
   elseif key == "s" then
@@ -109,6 +122,7 @@ function love.mousepressed(x, y, button, istouch, presses)
       radius = presses > 1 and 24 or 8,
       color = {love.math.random(), love.math.random(), love.math.random()},
     }
+    play_blip((#dots - 1) % 15)
   elseif button == 2 then
     dots = {}
   end
@@ -125,6 +139,24 @@ function love.quit()
     last_event = "love.quit refused, escape again to really quit"
     return true
   end
+end
+
+-- a source that is still sounding can't start again, so quick clicks each
+-- get a clone of their own
+function play_blip(step)
+  local voice
+  for _, v in ipairs(voices) do
+    if not v:isPlaying() then voice = v break end
+  end
+  if not voice then
+    voice = blip:clone()
+    voices[#voices + 1] = voice
+  end
+
+  local octave = math.floor(step / #PENTATONIC)
+  local semitones = octave * 12 + PENTATONIC[step % #PENTATONIC + 1]
+  voice:setPitch(2 ^ (semitones / 12))
+  voice:play()
 end
 
 -- cuts the quad's square of the image into wedges around a point near the
@@ -298,6 +330,7 @@ function love.draw()
     love.keyboard.hasKeyRepeat() and "on" or "off",
     love.mouse.isVisible() and "shown" or "hidden",
     seed), 12, 52)
+  g.print(("voices %d   drone %s"):format(#voices, drone:isPlaying() and "on" or "off"), 12, 72)
   g.print("last event: " .. last_event, 12, h - 28)
 
   -- printf aligns inside a box, and getWidth says how wide text will be

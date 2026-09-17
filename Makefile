@@ -16,7 +16,7 @@ LUA_LIB := \
 	lauxlib.c lbaselib.c lbitlib.c lcorolib.c ldblib.c liolib.c lmathlib.c \
 	loslib.c lstrlib.c ltablib.c loadlib.c linit.c
 SOURCES := main.c $(addprefix $(LUA_DIR)/,$(LUA_CORE) $(LUA_LIB))
-ASSETS := hi.png font1.png
+ASSETS := hi.png font1.png blip.wav
 
 JS_SRCS := $(shell find js -type f -name '*.js' ! -name 'wasm-aroma.js')
 BUNDLE := $(OUT_DIR)/app.js
@@ -38,7 +38,7 @@ $(TARGET_JS): main.c | lua-5.2 js
 $(BUNDLE): $(JS_SRCS) $(TARGET_JS) | $(OUT_DIR)
 	$(ESBUILD) js/shell.js --bundle --format=esm --platform=browser --outfile=$(BUNDLE)
 
-$(HTML_OUT): $(SHELL_FILE) $(BUNDLE) $(TARGET_JS)
+$(HTML_OUT): $(SHELL_FILE) $(BUNDLE) $(TARGET_JS) $(ASSETS)
 	cp $(SHELL_FILE) $(HTML_OUT)
 	cp $(WASM_OUT) $(OUT_DIR)/
 	@if [ -f $(DATA_OUT) ]; then cp $(DATA_OUT) $(OUT_DIR)/; fi
