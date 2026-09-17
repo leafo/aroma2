@@ -911,6 +911,284 @@ static int l_timer_getFPS(lua_State *L) {
     return 1;
 }
 
+/* love.math. The generator and noise follow love 11 bit for bit so that
+ * seeded content (procedural art, level layouts) matches the desktop. */
+
+typedef struct {
+    uint64_t seed;
+    uint64_t state;
+    /* Box-Muller makes normals in pairs, the spare is kept for the next call */
+    double spare_normal;
+    int has_spare_normal;
+} AromaRandom;
+
+static AromaRandom g_random;
+
+/* Thomas Wang's 64 bit integer hash. Xorshift spreads similar seeds poorly */
+static uint64_t wang_hash64(uint64_t key) {
+    key = (~key) + (key << 21);
+    key = key ^ (key >> 24);
+    key = (key + (key << 3)) + (key << 8);
+    key = key ^ (key >> 14);
+    key = (key + (key << 2)) + (key << 4);
+    key = key ^ (key >> 28);
+    key = key + (key << 31);
+    return key;
+}
+
+static void random_set_seed(AromaRandom *rng, uint64_t seed) {
+    rng->seed = seed;
+    do {
+        seed = wang_hash64(seed);
+    } while (seed == 0);
+    rng->state = seed;
+    rng->has_spare_normal = 0;
+}
+
+/* xorshift64*, uniform in [0, 1) */
+static double random_next(AromaRandom *rng) {
+    rng->state ^= rng->state >> 12;
+    rng->state ^= rng->state << 25;
+    rng->state ^= rng->state >> 27;
+    uint64_t r = rng->state * 2685821657736338717ULL;
+
+    union { uint64_t i; double d; } u;
+    u.i = (0x3FFULL << 52) | (r >> 12);
+    return u.d - 1.0;
+}
+
+static double random_next_normal(AromaRandom *rng, double stddev) {
+    if (rng->has_spare_normal) {
+        rng->has_spare_normal = 0;
+        return rng->spare_normal * stddev;
+    }
+
+    double r = sqrt(-2.0 * log(1.0 - random_next(rng)));
+    double phi = 2.0 * M_PI * (1.0 - random_next(rng));
+
+    rng->spare_normal = r * cos(phi);
+    rng->has_spare_normal = 1;
+    return r * sin(phi) * stddev;
+}
+
+static AromaRandom *check_random(lua_State *L, int idx) {
+    return (AromaRandom *)luaL_checkudata(L, idx, "aroma.random_generator");
+}
+
+/* A seed is one number, or the low and high 32 bits as two */
+static uint64_t check_random_seed(lua_State *L, int idx) {
+    if (lua_isnoneornil(L, idx + 1)) {
+        double num = luaL_checknumber(L, idx);
+        luaL_argcheck(L, num >= 0 && num < 18446744073709551616.0, idx, "seed out of range");
+        return (uint64_t)num;
+    }
+    uint64_t low = (uint32_t)luaL_checknumber(L, idx);
+    uint64_t high = (uint32_t)luaL_checknumber(L, idx + 1);
+    return low | (high << 32);
+}
+
+/* random(), random(max) and random(min, max), the arguments start at idx */
+static int push_random(lua_State *L, AromaRandom *rng, int idx) {
+    double r = random_next(rng);
+    double low = 1.0, high;
+
+    switch (lua_gettop(L) - (idx - 1)) {
+        case 0:
+            lua_pushnumber(L, r);
+            return 1;
+        case 1:
+            high = floor(luaL_checknumber(L, idx));
+            break;
+        default:
+            low = floor(luaL_checknumber(L, idx));
+            high = floor(luaL_checknumber(L, idx + 1));
+            break;
+    }
+
+    luaL_argcheck(L, low <= high, idx, "interval is empty");
+    lua_pushnumber(L, floor(r * (high - low + 1.0)) + low);
+    return 1;
+}
+
+static int push_random_normal(lua_State *L, AromaRandom *rng, int idx) {
+    double stddev = luaL_optnumber(L, idx, 1.0);
+    double mean = luaL_optnumber(L, idx + 1, 0.0);
+    lua_pushnumber(L, random_next_normal(rng, stddev) + mean);
+    return 1;
+}
+
+static int push_random_seed(lua_State *L, AromaRandom *rng) {
+    lua_pushnumber(L, (double)(uint32_t)(rng->seed & 0xFFFFFFFFu));
+    lua_pushnumber(L, (double)(uint32_t)(rng->seed >> 32));
+    return 2;
+}
+
+static int l_math_random(lua_State *L) {
+    return push_random(L, &g_random, 1);
+}
+
+static int l_math_randomNormal(lua_State *L) {
+    return push_random_normal(L, &g_random, 1);
+}
+
+static int l_math_setRandomSeed(lua_State *L) {
+    random_set_seed(&g_random, check_random_seed(L, 1));
+    return 0;
+}
+
+static int l_math_getRandomSeed(lua_State *L) {
+    return push_random_seed(L, &g_random);
+}
+
+static int l_math_newRandomGenerator(lua_State *L) {
+    /* love's default seed, every unseeded generator gives the same run */
+    uint64_t seed = 0x0139408DCBBF7A44ULL;
+    if (!lua_isnoneornil(L, 1)) {
+        seed = check_random_seed(L, 1);
+    }
+
+    AromaRandom *rng = (AromaRandom *)lua_newuserdata(L, sizeof(AromaRandom));
+    random_set_seed(rng, seed);
+    luaL_getmetatable(L, "aroma.random_generator");
+    lua_setmetatable(L, -2);
+    return 1;
+}
+
+static int l_random_random(lua_State *L) {
+    return push_random(L, check_random(L, 1), 2);
+}
+
+static int l_random_randomNormal(lua_State *L) {
+    return push_random_normal(L, check_random(L, 1), 2);
+}
+
+static int l_random_setSeed(lua_State *L) {
+    random_set_seed(check_random(L, 1), check_random_seed(L, 2));
+    return 0;
+}
+
+static int l_random_getSeed(lua_State *L) {
+    return push_random_seed(L, check_random(L, 1));
+}
+
+/* Simplex noise after Stefan Gustavson's simplexnoise1234, the one love uses
+ * for 1 and 2 dimensions */
+static const unsigned char noise_perm[256] = {
+    151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,140,36,103,30,69,
+    142,8,99,37,240,21,10,23,190,6,148,247,120,234,75,0,26,197,62,94,252,219,
+    203,117,35,11,32,57,177,33,88,237,149,56,87,174,20,125,136,171,168,68,175,
+    74,165,71,134,139,48,27,166,77,146,158,231,83,111,229,122,60,211,133,230,
+    220,105,92,41,55,46,245,40,244,102,143,54,65,25,63,161,1,216,80,73,209,76,
+    132,187,208,89,18,169,200,196,135,130,116,188,159,86,164,100,109,198,173,
+    186,3,64,52,217,226,250,124,123,5,202,38,147,118,126,255,82,85,212,207,
+    206,59,227,47,16,58,17,182,189,28,42,223,183,170,213,119,248,152,2,44,154,
+    163,70,221,153,101,155,167,43,172,9,129,22,39,253,19,98,108,110,79,113,
+    224,232,178,185,112,104,218,246,97,228,251,34,242,193,238,210,144,12,191,
+    179,162,241,81,51,145,235,249,14,239,107,49,192,214,31,181,199,106,157,
+    184,84,204,176,115,121,50,45,127,4,150,254,138,236,205,93,222,114,67,29,
+    24,72,243,141,128,195,78,66,215,61,156,180
+};
+
+static int noise_hash(int i) {
+    return noise_perm[i & 0xff];
+}
+
+static int noise_floor(float x) {
+    return x > 0 ? (int)x : (int)x - 1;
+}
+
+static float noise_grad1(int hash, float x) {
+    int h = hash & 15;
+    float grad = 1.0f + (h & 7);
+    if (h & 8) grad = -grad;
+    return grad * x;
+}
+
+static float noise_grad2(int hash, float x, float y) {
+    int h = hash & 7;
+    float u = h < 4 ? x : y;
+    float v = h < 4 ? y : x;
+    return ((h & 1) ? -u : u) + ((h & 2) ? -2.0f * v : 2.0f * v);
+}
+
+static float simplex_noise1(float x) {
+    int i0 = noise_floor(x);
+    int i1 = i0 + 1;
+    float x0 = x - i0;
+    float x1 = x0 - 1.0f;
+
+    float t0 = 1.0f - x0 * x0;
+    t0 *= t0;
+    float n0 = t0 * t0 * noise_grad1(noise_hash(i0), x0);
+
+    float t1 = 1.0f - x1 * x1;
+    t1 *= t1;
+    float n1 = t1 * t1 * noise_grad1(noise_hash(i1), x1);
+
+    return 0.395f * (n0 + n1);
+}
+
+static float simplex_corner2(int hash, float x, float y) {
+    float t = 0.5f - x * x - y * y;
+    if (t < 0.0f) {
+        return 0.0f;
+    }
+    t *= t;
+    return t * t * noise_grad2(hash, x, y);
+}
+
+static float simplex_noise2(float x, float y) {
+    /* Doubles, as in the original: the float math around them widens and
+     * rounds differently with float constants, and the output drifts from
+     * love's in the 6th place */
+    const double F2 = 0.366025403; /* 0.5 * (sqrt(3) - 1) */
+    const double G2 = 0.211324865; /* (3 - sqrt(3)) / 6 */
+
+    /* Skew into the grid of squares to find which cell we're in */
+    float s = (x + y) * F2;
+    float xs = x + s;
+    float ys = y + s;
+    int i = noise_floor(xs);
+    int j = noise_floor(ys);
+
+    float t = (float)(i + j) * G2;
+    float origin_x = i - t;
+    float origin_y = j - t;
+    float x0 = x - origin_x;
+    float y0 = y - origin_y;
+
+    /* Lower triangle goes through (1, 0), upper through (0, 1) */
+    int i1 = x0 > y0 ? 1 : 0;
+    int j1 = 1 - i1;
+
+    float x1 = x0 - i1 + G2;
+    float y1 = y0 - j1 + G2;
+    float x2 = x0 - 1.0f + 2.0f * G2;
+    float y2 = y0 - 1.0f + 2.0f * G2;
+
+    float n0 = simplex_corner2(noise_hash(i + noise_hash(j)), x0, y0);
+    float n1 = simplex_corner2(noise_hash(i + i1 + noise_hash(j + j1)), x1, y1);
+    float n2 = simplex_corner2(noise_hash(i + 1 + noise_hash(j + 1)), x2, y2);
+
+    return 45.23f * (n0 + n1 + n2);
+}
+
+static int l_math_noise(lua_State *L) {
+    int nargs = lua_gettop(L);
+    float n;
+
+    if (nargs <= 1) {
+        n = simplex_noise1((float)luaL_checknumber(L, 1));
+    } else if (nargs == 2) {
+        n = simplex_noise2((float)luaL_checknumber(L, 1), (float)luaL_checknumber(L, 2));
+    } else {
+        return luaL_error(L, "love.math.noise: only 1 and 2 dimensions are supported");
+    }
+
+    lua_pushnumber(L, n * 0.5f + 0.5f);
+    return 1;
+}
+
 static void register_aroma_api(lua_State *L) {
     if (luaL_newmetatable(L, "aroma.image")) {
         lua_pushcfunction(L, l_image_gc);
@@ -930,6 +1208,20 @@ static void register_aroma_api(lua_State *L) {
         lua_setfield(L, -2, "__gc");
 
         lua_newtable(L);
+        lua_setfield(L, -2, "__index");
+    }
+    lua_pop(L, 1);
+
+    if (luaL_newmetatable(L, "aroma.random_generator")) {
+        lua_newtable(L);
+        lua_pushcfunction(L, l_random_random);
+        lua_setfield(L, -2, "random");
+        lua_pushcfunction(L, l_random_randomNormal);
+        lua_setfield(L, -2, "randomNormal");
+        lua_pushcfunction(L, l_random_setSeed);
+        lua_setfield(L, -2, "setSeed");
+        lua_pushcfunction(L, l_random_getSeed);
+        lua_setfield(L, -2, "getSeed");
         lua_setfield(L, -2, "__index");
     }
     lua_pop(L, 1);
@@ -1003,6 +1295,21 @@ static void register_aroma_api(lua_State *L) {
     lua_pushcfunction(L, l_timer_getFPS);
     lua_setfield(L, -2, "getFPS");
     lua_setfield(L, -2, "timer");    /* aroma.timer = table */
+
+    lua_newtable(L);                /* aroma.math */
+    lua_pushcfunction(L, l_math_random);
+    lua_setfield(L, -2, "random");
+    lua_pushcfunction(L, l_math_randomNormal);
+    lua_setfield(L, -2, "randomNormal");
+    lua_pushcfunction(L, l_math_setRandomSeed);
+    lua_setfield(L, -2, "setRandomSeed");
+    lua_pushcfunction(L, l_math_getRandomSeed);
+    lua_setfield(L, -2, "getRandomSeed");
+    lua_pushcfunction(L, l_math_newRandomGenerator);
+    lua_setfield(L, -2, "newRandomGenerator");
+    lua_pushcfunction(L, l_math_noise);
+    lua_setfield(L, -2, "noise");
+    lua_setfield(L, -2, "math");     /* aroma.math = table */
 
     lua_setglobal(L, "aroma");
 
@@ -1371,6 +1678,9 @@ EMSCRIPTEN_KEEPALIVE int run_lua_code(const char *code) {
 
     luaL_openlibs(g_state.L);
     register_aroma_api(g_state.L);
+
+    /* Every run starts somewhere new, scripts that want a fixed run seed it */
+    random_set_seed(&g_random, (uint64_t)emscripten_get_now() ^ ((uint64_t)(emscripten_random() * 4294967296.0) << 32));
 
     lua_State *T = script_thread_begin(SCRIPT_ENTRY_BOOTSTRAP);
     if (luaL_loadstring(T, bootstrap_source) != LUA_OK ||
