@@ -22,12 +22,35 @@ typedef struct {
     float m[9];
 } Mat3;
 
+typedef enum { FILTER_LINEAR, FILTER_NEAREST } FilterMode;
+typedef enum { WRAP_CLAMP, WRAP_REPEAT, WRAP_MIRRORED_REPEAT } WrapMode;
+
+static const char *const filter_names[] = {"linear", "nearest", NULL};
+static const char *const wrap_names[] = {"clamp", "repeat", "mirroredrepeat", NULL};
+
+/* Sampling state of a texture. It lives on the C side so the getters don't
+ * need the page, which only hears about changes */
+typedef struct {
+    FilterMode min;
+    FilterMode mag;
+    WrapMode wrap_h;
+    WrapMode wrap_v;
+} TextureParams;
+
 typedef struct {
     int texture_id;
     int width;
     int height;
     int loaded;
+    TextureParams params;
 } AromaImage;
+
+/* A rectangle of a texture, sw and sh being the size of the texture it was
+ * measured against */
+typedef struct {
+    float x, y, w, h;
+    float sw, sh;
+} AromaQuad;
 
 typedef struct {
     int x;           // x position in texture
@@ -45,6 +68,7 @@ typedef struct {
     /* Multiple of the font's height that a line advances by */
     float line_height;
     int loaded;
+    TextureParams params;
 } AromaFont;
 
 /* What push("all") saves next to the transform */
@@ -118,6 +142,9 @@ typedef struct {
     int resource_wait;
     /* Mouse state is pushed in by the page's events so reads from Lua don't
      * cross into JS. Buttons are a bitmask, love's button n is bit n - 1 */
+    /* What new textures are sampled with, setDefaultFilter changes it */
+    FilterMode default_min;
+    FilterMode default_mag;
     int mouse_x;
     int mouse_y;
     unsigned int mouse_buttons;
@@ -235,6 +262,10 @@ EM_JS(void, js_request_texture_load, (int generation, uintptr_t image_ptr, const
 
 EM_JS(void, js_bind_texture, (int texture_id), {
   Module.bindTexture(texture_id);
+});
+
+EM_JS(void, js_set_texture_params, (int texture_id, int min_nearest, int mag_nearest, int wrap_h, int wrap_v), {
+  Module.setTextureParams(texture_id, min_nearest, mag_nearest, wrap_h, wrap_v);
 });
 
 EM_JS(void, js_release_texture, (int texture_id), {
@@ -365,6 +396,86 @@ static Mat3 *current_matrix(void) {
 
 static AromaImage *check_image(lua_State *L, int idx) {
     return (AromaImage *)luaL_checkudata(L, idx, "aroma.image");
+}
+
+static AromaQuad *check_quad(lua_State *L, int idx) {
+    return (AromaQuad *)luaL_checkudata(L, idx, "aroma.quad");
+}
+
+static void apply_texture_params(int texture_id, const TextureParams *params) {
+    if (texture_id) {
+        js_set_texture_params(texture_id, params->min == FILTER_NEAREST, params->mag == FILTER_NEAREST,
+                              params->wrap_h, params->wrap_v);
+    }
+}
+
+static void default_texture_params(TextureParams *params) {
+    params->min = g_state.default_min;
+    params->mag = g_state.default_mag;
+    params->wrap_h = WRAP_CLAMP;
+    params->wrap_v = WRAP_CLAMP;
+}
+
+/* setFilter(min, mag) on a texture whose id and params are given. A texture
+ * still loading has no id yet, the params are applied when it arrives */
+static int set_filter(lua_State *L, int texture_id, TextureParams *params) {
+    params->min = (FilterMode)luaL_checkoption(L, 2, NULL, filter_names);
+    params->mag = (FilterMode)luaL_checkoption(L, 3, filter_names[params->min], filter_names);
+    apply_texture_params(texture_id, params);
+    return 0;
+}
+
+static int get_filter(lua_State *L, const TextureParams *params) {
+    lua_pushstring(L, filter_names[params->min]);
+    lua_pushstring(L, filter_names[params->mag]);
+    return 2;
+}
+
+static int set_wrap(lua_State *L, int texture_id, TextureParams *params) {
+    params->wrap_h = (WrapMode)luaL_checkoption(L, 2, NULL, wrap_names);
+    params->wrap_v = (WrapMode)luaL_checkoption(L, 3, wrap_names[params->wrap_h], wrap_names);
+    apply_texture_params(texture_id, params);
+    return 0;
+}
+
+static int get_wrap(lua_State *L, const TextureParams *params) {
+    lua_pushstring(L, wrap_names[params->wrap_h]);
+    lua_pushstring(L, wrap_names[params->wrap_v]);
+    return 2;
+}
+
+/* type() and typeOf() of every object. The names an object answers to are
+ * the upvalues, its own type first */
+static int l_object_type(lua_State *L) {
+    lua_pushvalue(L, lua_upvalueindex(1));
+    return 1;
+}
+
+static int l_object_typeOf(lua_State *L) {
+    const char *name = luaL_checkstring(L, 2);
+    for (int i = 1; !lua_isnone(L, lua_upvalueindex(i)); i++) {
+        if (strcmp(name, lua_tostring(L, lua_upvalueindex(i))) == 0) {
+            lua_pushboolean(L, 1);
+            return 1;
+        }
+    }
+    lua_pushboolean(L, 0);
+    return 1;
+}
+
+/* Adds type and typeOf to the method table on top of the stack. names runs
+ * from the object's own type up its parents and ends in NULL */
+static void register_object_type(lua_State *L, const char *const *names) {
+    int count = 0;
+    for (; names[count]; count++) {
+        lua_pushstring(L, names[count]);
+    }
+    lua_pushcclosure(L, l_object_typeOf, count);
+    lua_setfield(L, -2, "typeOf");
+
+    lua_pushstring(L, names[0]);
+    lua_pushcclosure(L, l_object_type, 1);
+    lua_setfield(L, -2, "type");
 }
 
 static AromaFont *check_font(lua_State *L, int idx) {
@@ -782,6 +893,7 @@ static int l_graphics_newImage(lua_State *L) {
 
     AromaImage *img = (AromaImage *)lua_newuserdata(L, sizeof(AromaImage));
     memset(img, 0, sizeof(AromaImage));
+    default_texture_params(&img->params);
 
     luaL_getmetatable(L, "aroma.image");
     lua_setmetatable(L, -2);
@@ -1085,15 +1197,24 @@ static void draw_text_lines(lua_State *L, AromaFont *font, const Mat3 *transform
     glDisableVertexAttribArray(1);
 }
 
+/* draw(image, [quad], x, y, r, sx, sy, ox, oy) */
 static int l_graphics_draw(lua_State *L) {
     AromaImage *img = check_image(L, 1);
-    float x = (float)luaL_optnumber(L, 2, 0.0);
-    float y = (float)luaL_optnumber(L, 3, 0.0);
-    float r = (float)luaL_optnumber(L, 4, 0.0);
-    float sx = (float)luaL_optnumber(L, 5, 1.0);
-    float sy = (float)luaL_optnumber(L, 6, sx);
-    float ox = (float)luaL_optnumber(L, 7, 0.0);
-    float oy = (float)luaL_optnumber(L, 8, 0.0);
+
+    AromaQuad *quad = NULL;
+    int idx = 2;
+    if (lua_type(L, 2) == LUA_TUSERDATA) {
+        quad = check_quad(L, 2);
+        idx = 3;
+    }
+
+    float x = (float)luaL_optnumber(L, idx, 0.0);
+    float y = (float)luaL_optnumber(L, idx + 1, 0.0);
+    float r = (float)luaL_optnumber(L, idx + 2, 0.0);
+    float sx = (float)luaL_optnumber(L, idx + 3, 1.0);
+    float sy = (float)luaL_optnumber(L, idx + 4, sx);
+    float ox = (float)luaL_optnumber(L, idx + 5, 0.0);
+    float oy = (float)luaL_optnumber(L, idx + 6, 0.0);
 
     if (!img->loaded || img->texture_id == 0) {
         return 0;
@@ -1103,18 +1224,26 @@ static int l_graphics_draw(lua_State *L) {
         return 0;
     }
 
-
-
     Mat3 final;
     mat3_local(&final, current_matrix(), x, y, r, sx, sy, ox, oy);
 
     float w = (float)img->width;
     float h = (float)img->height;
+    float u1 = 0.0f, v1 = 0.0f, u2 = 1.0f, v2 = 1.0f;
+    if (quad) {
+        w = quad->w;
+        h = quad->h;
+        u1 = quad->x / quad->sw;
+        v1 = quad->y / quad->sh;
+        u2 = (quad->x + quad->w) / quad->sw;
+        v2 = (quad->y + quad->h) / quad->sh;
+    }
+
     float vertices[] = {
-        0.0f, 0.0f, 0.0f, 0.0f,
-        w,    0.0f, 1.0f, 0.0f,
-        w,    h,    1.0f, 1.0f,
-        0.0f, h,    0.0f, 1.0f
+        0.0f, 0.0f, u1, v1,
+        w,    0.0f, u2, v1,
+        w,    h,    u2, v2,
+        0.0f, h,    u1, v2
     };
 
     glUseProgram(g_state.program);
@@ -1142,6 +1271,89 @@ static int l_graphics_draw(lua_State *L) {
 
     glDisableVertexAttribArray(1);
     return 0;
+}
+
+/* newQuad(x, y, w, h, sw, sh), or a texture in place of sw, sh */
+static int l_graphics_newQuad(lua_State *L) {
+    float x = (float)luaL_checknumber(L, 1);
+    float y = (float)luaL_checknumber(L, 2);
+    float w = (float)luaL_checknumber(L, 3);
+    float h = (float)luaL_checknumber(L, 4);
+    float sw, sh;
+
+    if (lua_type(L, 5) == LUA_TUSERDATA) {
+        AromaImage *img = check_image(L, 5);
+        sw = (float)img->width;
+        sh = (float)img->height;
+    } else {
+        sw = (float)luaL_checknumber(L, 5);
+        sh = (float)luaL_checknumber(L, 6);
+    }
+    luaL_argcheck(L, sw > 0.0f && sh > 0.0f, 5, "reference size must be positive");
+
+    AromaQuad *quad = (AromaQuad *)lua_newuserdata(L, sizeof(AromaQuad));
+    quad->x = x;
+    quad->y = y;
+    quad->w = w;
+    quad->h = h;
+    quad->sw = sw;
+    quad->sh = sh;
+    luaL_getmetatable(L, "aroma.quad");
+    lua_setmetatable(L, -2);
+    return 1;
+}
+
+static int l_quad_getViewport(lua_State *L) {
+    AromaQuad *quad = check_quad(L, 1);
+    lua_pushnumber(L, quad->x);
+    lua_pushnumber(L, quad->y);
+    lua_pushnumber(L, quad->w);
+    lua_pushnumber(L, quad->h);
+    return 4;
+}
+
+/* setViewport(x, y, w, h, [sw, sh]) */
+static int l_quad_setViewport(lua_State *L) {
+    AromaQuad *quad = check_quad(L, 1);
+    float x = (float)luaL_checknumber(L, 2);
+    float y = (float)luaL_checknumber(L, 3);
+    float w = (float)luaL_checknumber(L, 4);
+    float h = (float)luaL_checknumber(L, 5);
+
+    if (!lua_isnoneornil(L, 6)) {
+        float sw = (float)luaL_checknumber(L, 6);
+        float sh = (float)luaL_checknumber(L, 7);
+        luaL_argcheck(L, sw > 0.0f && sh > 0.0f, 6, "reference size must be positive");
+        quad->sw = sw;
+        quad->sh = sh;
+    }
+
+    quad->x = x;
+    quad->y = y;
+    quad->w = w;
+    quad->h = h;
+    return 0;
+}
+
+static int l_quad_getTextureDimensions(lua_State *L) {
+    AromaQuad *quad = check_quad(L, 1);
+    lua_pushnumber(L, quad->sw);
+    lua_pushnumber(L, quad->sh);
+    return 2;
+}
+
+/* setDefaultFilter(min, mag) */
+static int l_graphics_setDefaultFilter(lua_State *L) {
+    FilterMode min = (FilterMode)luaL_checkoption(L, 1, NULL, filter_names);
+    g_state.default_mag = (FilterMode)luaL_checkoption(L, 2, filter_names[min], filter_names);
+    g_state.default_min = min;
+    return 0;
+}
+
+static int l_graphics_getDefaultFilter(lua_State *L) {
+    lua_pushstring(L, filter_names[g_state.default_min]);
+    lua_pushstring(L, filter_names[g_state.default_mag]);
+    return 2;
 }
 
 static int l_graphics_getWidth(lua_State *L) {
@@ -1190,14 +1402,43 @@ static int l_image_getHeight(lua_State *L) {
     return 1;
 }
 
-static int l_image_gc(lua_State *L) {
+static int l_image_getDimensions(lua_State *L) {
     AromaImage *img = check_image(L, 1);
-    if (img->texture_id) {
+    lua_pushinteger(L, img->width);
+    lua_pushinteger(L, img->height);
+    return 2;
+}
+
+static int l_image_setFilter(lua_State *L) {
+    AromaImage *img = check_image(L, 1);
+    return set_filter(L, img->texture_id, &img->params);
+}
+
+static int l_image_getFilter(lua_State *L) {
+    return get_filter(L, &check_image(L, 1)->params);
+}
+
+static int l_image_setWrap(lua_State *L) {
+    AromaImage *img = check_image(L, 1);
+    return set_wrap(L, img->texture_id, &img->params);
+}
+
+static int l_image_getWrap(lua_State *L) {
+    return get_wrap(L, &check_image(L, 1)->params);
+}
+
+/* Frees the texture now rather than whenever the collector gets to it. The
+ * image draws nothing afterwards. Also the __gc */
+static int l_image_release(lua_State *L) {
+    AromaImage *img = check_image(L, 1);
+    int had_texture = img->texture_id != 0;
+    if (had_texture) {
         js_release_texture(img->texture_id);
         img->texture_id = 0;
     }
     img->loaded = 0;
-    return 0;
+    lua_pushboolean(L, had_texture);
+    return 1;
 }
 
 static int l_graphics_newImageFont_cont(lua_State *L) {
@@ -1220,6 +1461,7 @@ static int l_graphics_newImageFont(lua_State *L) {
     AromaFont *font = (AromaFont *)lua_newuserdata(L, sizeof(AromaFont));
     memset(font, 0, sizeof(AromaFont));
     font->extra_spacing = (float)spacing;
+    default_texture_params(&font->params);
 
     luaL_getmetatable(L, "aroma.font");
     lua_setmetatable(L, -2);
@@ -1381,6 +1623,15 @@ static int l_font_getWrap(lua_State *L) {
     lua_pushnumber(L, widest);
     lua_insert(L, -2);
     return 2;
+}
+
+static int l_font_setFilter(lua_State *L) {
+    AromaFont *font = check_font(L, 1);
+    return set_filter(L, font->texture_id, &font->params);
+}
+
+static int l_font_getFilter(lua_State *L) {
+    return get_filter(L, &check_font(L, 1)->params);
 }
 
 static int l_font_hasGlyphs(lua_State *L) {
@@ -1858,7 +2109,7 @@ static int l_math_noise(lua_State *L) {
 
 static void register_aroma_api(lua_State *L) {
     if (luaL_newmetatable(L, "aroma.image")) {
-        lua_pushcfunction(L, l_image_gc);
+        lua_pushcfunction(L, l_image_release);
         lua_setfield(L, -2, "__gc");
 
         lua_newtable(L);
@@ -1866,6 +2117,32 @@ static void register_aroma_api(lua_State *L) {
         lua_setfield(L, -2, "getWidth");
         lua_pushcfunction(L, l_image_getHeight);
         lua_setfield(L, -2, "getHeight");
+        lua_pushcfunction(L, l_image_getDimensions);
+        lua_setfield(L, -2, "getDimensions");
+        lua_pushcfunction(L, l_image_setFilter);
+        lua_setfield(L, -2, "setFilter");
+        lua_pushcfunction(L, l_image_getFilter);
+        lua_setfield(L, -2, "getFilter");
+        lua_pushcfunction(L, l_image_setWrap);
+        lua_setfield(L, -2, "setWrap");
+        lua_pushcfunction(L, l_image_getWrap);
+        lua_setfield(L, -2, "getWrap");
+        lua_pushcfunction(L, l_image_release);
+        lua_setfield(L, -2, "release");
+        register_object_type(L, (const char *const[]){"Image", "Texture", "Drawable", "Object", NULL});
+        lua_setfield(L, -2, "__index");
+    }
+    lua_pop(L, 1);
+
+    if (luaL_newmetatable(L, "aroma.quad")) {
+        lua_newtable(L);
+        lua_pushcfunction(L, l_quad_getViewport);
+        lua_setfield(L, -2, "getViewport");
+        lua_pushcfunction(L, l_quad_setViewport);
+        lua_setfield(L, -2, "setViewport");
+        lua_pushcfunction(L, l_quad_getTextureDimensions);
+        lua_setfield(L, -2, "getTextureDimensions");
+        register_object_type(L, (const char *const[]){"Quad", "Object", NULL});
         lua_setfield(L, -2, "__index");
     }
     lua_pop(L, 1);
@@ -1887,6 +2164,11 @@ static void register_aroma_api(lua_State *L) {
         lua_setfield(L, -2, "getWrap");
         lua_pushcfunction(L, l_font_hasGlyphs);
         lua_setfield(L, -2, "hasGlyphs");
+        lua_pushcfunction(L, l_font_setFilter);
+        lua_setfield(L, -2, "setFilter");
+        lua_pushcfunction(L, l_font_getFilter);
+        lua_setfield(L, -2, "getFilter");
+        register_object_type(L, (const char *const[]){"Font", "Object", NULL});
         lua_setfield(L, -2, "__index");
     }
     lua_pop(L, 1);
@@ -1964,6 +2246,15 @@ static void register_aroma_api(lua_State *L) {
 
     lua_pushcfunction(L, l_graphics_draw);
     lua_setfield(L, -2, "draw");
+
+    lua_pushcfunction(L, l_graphics_newQuad);
+    lua_setfield(L, -2, "newQuad");
+
+    lua_pushcfunction(L, l_graphics_setDefaultFilter);
+    lua_setfield(L, -2, "setDefaultFilter");
+
+    lua_pushcfunction(L, l_graphics_getDefaultFilter);
+    lua_setfield(L, -2, "getDefaultFilter");
 
     lua_pushcfunction(L, l_graphics_getWidth);
     lua_setfield(L, -2, "getWidth");
@@ -2219,6 +2510,7 @@ EMSCRIPTEN_KEEPALIVE void aroma_image_loaded(int generation, uintptr_t image_ptr
     img->width = width;
     img->height = height;
     img->loaded = texture_id != 0;
+    apply_texture_params(texture_id, &img->params);
 
     if (g_state.script_thread) {
         resume_resource_wait();
@@ -2259,6 +2551,7 @@ EMSCRIPTEN_KEEPALIVE void aroma_font_set_glyphs(int generation, uintptr_t font_p
     }
 
     font->line_height = 1.0f;
+    apply_texture_params(texture_id, &font->params);
     font->loaded = texture_id != 0 && glyph_count > 0;
 
     if (g_state.script_thread) {
@@ -2384,6 +2677,8 @@ static void default_graphics_state(void) {
     gfx->line_width = 1.0f;
     gfx->font = NULL;
     gfx->font_ref = LUA_NOREF;
+    g_state.default_min = FILTER_LINEAR;
+    g_state.default_mag = FILTER_LINEAR;
 
     /* Anything the stack saved was anchored in a lua state that is gone */
     memset(g_state.stack, 0, sizeof(g_state.stack));

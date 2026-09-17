@@ -190,6 +190,13 @@ export async function initAroma(canvas) {
       }
     };
 
+    Module.setTextureParams = (id, minNearest, magNearest, wrapH, wrapV) => {
+      const store = ensureTextureStore(Module);
+      if (store) {
+        store.setParams(id, minNearest, magNearest, wrapH, wrapV);
+      }
+    };
+
     Module.releaseTexture = (id) => {
       const store = ensureTextureStore(Module);
       if (store) {

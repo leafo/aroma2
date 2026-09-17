@@ -42,6 +42,37 @@ export function createTextureStore(gl) {
     return createTextureFromSource(source, opts);
   }
 
+  const isPowerOfTwo = (n) => (n & (n - 1)) === 0;
+  let warnedAboutWrap = false;
+
+  // wrap modes are indexed clamp, repeat, mirroredrepeat
+  function setParams(id, minNearest, magNearest, wrapH, wrapV) {
+    const entry = textures.get(id);
+    if (!entry) return;
+
+    const wraps = [gl.CLAMP_TO_EDGE, gl.REPEAT, gl.MIRRORED_REPEAT];
+    let wrapS = wraps[wrapH] ?? gl.CLAMP_TO_EDGE;
+    let wrapT = wraps[wrapV] ?? gl.CLAMP_TO_EDGE;
+
+    // WebGL 1 can only repeat textures with power of two sides, anything
+    // else samples as black
+    const canRepeat = isPowerOfTwo(entry.width) && isPowerOfTwo(entry.height);
+    if (!canRepeat && (wrapS !== gl.CLAMP_TO_EDGE || wrapT !== gl.CLAMP_TO_EDGE)) {
+      if (!warnedAboutWrap) {
+        warnedAboutWrap = true;
+        console.warn(`Texture wrap needs power of two sides, clamping a ${entry.width}x${entry.height} texture instead`);
+      }
+      wrapS = gl.CLAMP_TO_EDGE;
+      wrapT = gl.CLAMP_TO_EDGE;
+    }
+
+    gl.bindTexture(gl.TEXTURE_2D, entry.tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, minNearest ? gl.NEAREST : gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, magNearest ? gl.NEAREST : gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrapS);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrapT);
+  }
+
   function bind(id) {
     const entry = textures.get(id);
     if (!entry) return false;
@@ -59,6 +90,7 @@ export function createTextureStore(gl) {
   return {
     load,
     createFromSource,
+    setParams,
     bind,
     release,
   };

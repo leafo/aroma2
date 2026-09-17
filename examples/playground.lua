@@ -8,12 +8,14 @@
 --   h          hide / show the cursor
 --   w          switch the window between 800x600 and 640x480
 --   s          reseed the terrain
+--   f          switch the image between nearest and linear filtering
 --   space      hold to spin faster
 --   escape     quit, the first press is refused by love.quit
 
 local g = love.graphics
 
 local font
+local image, image_quad
 local seed = 1
 local terrain = {}
 local dots = {}
@@ -38,6 +40,11 @@ function love.load()
   g.setBackgroundColor(0.1, 0.1, 0.15)
   font = g.newImageFont("font1.png", [[ ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~!"#$%&'()*+,-./0123456789:;<=>?]])
   g.setFont(font)
+
+  -- new textures are linear unless setDefaultFilter says otherwise
+  image = g.newImage("hi.png")
+  local iw, ih = image:getDimensions()
+  image_quad = g.newQuad(iw * 0.25, ih * 0.3, iw * 0.5, ih * 0.4, iw, ih)
   love.window.setTitle("aroma playground")
   build_terrain()
 end
@@ -64,6 +71,8 @@ function love.keypressed(key, scancode, isrepeat)
     else
       love.window.setMode(800, 600)
     end
+  elseif key == "f" and not isrepeat then
+    image:setFilter(image:getFilter() == "linear" and "nearest" or "linear")
   elseif key == "s" then
     seed = seed + 1
     build_terrain()
@@ -153,6 +162,12 @@ function love.draw()
   g.rectangle("line", 0, 0, 20, 20)
   g.circle("line", 10, 10, 6)
   g.pop()
+
+  -- a quad cuts the middle out of the image, drawn big enough to show the filter
+  local _, _, qw, qh = image_quad:getViewport()
+  g.setColor(1, 1, 1)
+  g.draw(image, image_quad, 130, 270, math.sin(spin * 0.5) * 0.1, 1.5, 1.5, qw / 2, qh / 2)
+  g.print(image:getFilter(), 40, 340)
 
   for _, dot in ipairs(dots) do
     g.setColor(dot.color)
