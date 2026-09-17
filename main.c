@@ -43,6 +43,9 @@ typedef struct {
     int height;
     int loaded;
     TextureParams params;
+    /* A Canvas shares this struct so that drawing and sampling treat the two
+     * alike, only the metatable differs */
+    int is_canvas;
 } AromaImage;
 
 /* Pixels on the C side, RGBA bytes with the top row first. Scripts build
@@ -79,13 +82,27 @@ typedef struct {
     TextureParams params;
 } AromaFont;
 
-/* What push("all") saves next to the transform */
+typedef enum {
+    BLEND_ALPHA, BLEND_ADD, BLEND_SUBTRACT, BLEND_MULTIPLY, BLEND_REPLACE, BLEND_SCREEN
+} BlendMode;
+typedef enum { BLEND_ALPHA_MULTIPLY, BLEND_PREMULTIPLIED } BlendAlphaMode;
+
+static const char *const blend_mode_names[] = {"alpha", "add", "subtract", "multiply", "replace", "screen", NULL};
+static const char *const blend_alpha_names[] = {"alphamultiply", "premultiplied", NULL};
+
+/* What push("all") saves next to the transform. The font and canvas are
+ * anchored in the registry by their refs for as long as they're in here */
 typedef struct {
     float draw_color[4];
     float bg_color[4];
     float line_width;
     AromaFont *font;
     int font_ref;
+    /* NULL draws to the window */
+    AromaImage *canvas;
+    int canvas_ref;
+    BlendMode blend_mode;
+    BlendAlphaMode blend_alpha;
 } GraphicsState;
 
 typedef struct {
@@ -127,8 +144,8 @@ typedef struct {
     int fps;
     int fps_frames;
     double fps_window_start;
-    int canvas_width;
-    int canvas_height;
+    int window_width;
+    int window_height;
     /* Guards async load completions against a Lua state that was closed and
      * recreated while the load was in flight. */
     int generation;
@@ -164,6 +181,9 @@ typedef struct {
 } EngineState;
 
 static EngineState g_state;
+
+static void apply_render_target(void);
+static void apply_blend_mode(void);
 
 static const char *vertex_shader_source =
     "attribute vec2 aPosition;\n"
@@ -274,6 +294,15 @@ EM_JS(void, js_bind_texture, (int texture_id), {
 
 EM_JS(int, js_create_texture_from_pixels, (const unsigned char *pixels, int width, int height), {
   return Module.createTextureFromPixels(HEAPU8.subarray(pixels, pixels + width * height * 4), width, height);
+});
+
+EM_JS(int, js_create_canvas, (int width, int height), {
+  return Module.createCanvasTexture(width, height);
+});
+
+/* 0 is the window */
+EM_JS(void, js_bind_framebuffer, (int texture_id), {
+  Module.bindFramebuffer(texture_id);
 });
 
 EM_JS(void, js_set_texture_params, (int texture_id, int min_nearest, int mag_nearest, int wrap_h, int wrap_v), {
@@ -410,6 +439,17 @@ static AromaImage *check_image(lua_State *L, int idx) {
     return (AromaImage *)luaL_checkudata(L, idx, "aroma.image");
 }
 
+static AromaImage *check_texture(lua_State *L, int idx) {
+    AromaImage *img = (AromaImage *)luaL_testudata(L, idx, "aroma.image");
+    if (!img) {
+        img = (AromaImage *)luaL_testudata(L, idx, "aroma.canvas");
+    }
+    if (!img) {
+        luaL_argerror(L, idx, "Image or Canvas expected");
+    }
+    return img;
+}
+
 static AromaQuad *check_quad(lua_State *L, int idx) {
     return (AromaQuad *)luaL_checkudata(L, idx, "aroma.quad");
 }
@@ -440,7 +480,8 @@ static int set_filter(lua_State *L, int texture_id, TextureParams *params) {
 static int get_filter(lua_State *L, const TextureParams *params) {
     lua_pushstring(L, filter_names[params->min]);
     lua_pushstring(L, filter_names[params->mag]);
-    return 2;
+    lua_pushinteger(L, 1); /* anisotropy, not supported */
+    return 3;
 }
 
 static int set_wrap(lua_State *L, int texture_id, TextureParams *params) {
@@ -537,6 +578,10 @@ static int l_graphics_push(lua_State *L) {
             lua_rawgeti(L, LUA_REGISTRYINDEX, g_state.gfx.font_ref);
             entry->saved.font_ref = luaL_ref(L, LUA_REGISTRYINDEX);
         }
+        if (g_state.gfx.canvas_ref != LUA_NOREF) {
+            lua_rawgeti(L, LUA_REGISTRYINDEX, g_state.gfx.canvas_ref);
+            entry->saved.canvas_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        }
     }
     g_state.stack_top++;
     return 0;
@@ -549,12 +594,22 @@ static void release_font_ref(lua_State *L) {
     }
 }
 
+static void release_canvas_ref(lua_State *L) {
+    if (g_state.gfx.canvas_ref != LUA_NOREF) {
+        luaL_unref(L, LUA_REGISTRYINDEX, g_state.gfx.canvas_ref);
+        g_state.gfx.canvas_ref = LUA_NOREF;
+    }
+}
+
 static void pop_stack_entry(lua_State *L) {
     StackEntry *entry = &g_state.stack[g_state.stack_top];
     if (entry->has_state) {
         release_font_ref(L);
+        release_canvas_ref(L);
         g_state.gfx = entry->saved;
         entry->has_state = 0;
+        apply_render_target();
+        apply_blend_mode();
     }
     g_state.stack_top--;
 }
@@ -1415,7 +1470,10 @@ static void draw_text_lines(lua_State *L, AromaFont *font, const Mat3 *transform
 
 /* draw(image, [quad], x, y, r, sx, sy, ox, oy) */
 static int l_graphics_draw(lua_State *L) {
-    AromaImage *img = check_image(L, 1);
+    AromaImage *img = check_texture(L, 1);
+    if (img == g_state.gfx.canvas) {
+        return luaL_error(L, "love.graphics.draw: a canvas can't be drawn to itself");
+    }
 
     AromaQuad *quad = NULL;
     int idx = 2;
@@ -1498,7 +1556,7 @@ static int l_graphics_newQuad(lua_State *L) {
     float sw, sh;
 
     if (lua_type(L, 5) == LUA_TUSERDATA) {
-        AromaImage *img = check_image(L, 5);
+        AromaImage *img = check_texture(L, 5);
         sw = (float)img->width;
         sh = (float)img->height;
     } else {
@@ -1569,22 +1627,23 @@ static int l_graphics_setDefaultFilter(lua_State *L) {
 static int l_graphics_getDefaultFilter(lua_State *L) {
     lua_pushstring(L, filter_names[g_state.default_min]);
     lua_pushstring(L, filter_names[g_state.default_mag]);
-    return 2;
+    lua_pushinteger(L, 1); /* anisotropy */
+    return 3;
 }
 
 static int l_graphics_getWidth(lua_State *L) {
-    lua_pushinteger(L, g_state.canvas_width);
+    lua_pushinteger(L, g_state.window_width);
     return 1;
 }
 
 static int l_graphics_getHeight(lua_State *L) {
-    lua_pushinteger(L, g_state.canvas_height);
+    lua_pushinteger(L, g_state.window_height);
     return 1;
 }
 
 static int l_graphics_getDimensions(lua_State *L) {
-    lua_pushinteger(L, g_state.canvas_width);
-    lua_pushinteger(L, g_state.canvas_height);
+    lua_pushinteger(L, g_state.window_width);
+    lua_pushinteger(L, g_state.window_height);
     return 2;
 }
 
@@ -1607,46 +1666,53 @@ static int l_graphics_rectangle(lua_State *L) {
 }
 
 static int l_image_getWidth(lua_State *L) {
-    AromaImage *img = check_image(L, 1);
+    AromaImage *img = check_texture(L, 1);
     lua_pushinteger(L, img->width);
     return 1;
 }
 
 static int l_image_getHeight(lua_State *L) {
-    AromaImage *img = check_image(L, 1);
+    AromaImage *img = check_texture(L, 1);
     lua_pushinteger(L, img->height);
     return 1;
 }
 
 static int l_image_getDimensions(lua_State *L) {
-    AromaImage *img = check_image(L, 1);
+    AromaImage *img = check_texture(L, 1);
     lua_pushinteger(L, img->width);
     lua_pushinteger(L, img->height);
     return 2;
 }
 
 static int l_image_setFilter(lua_State *L) {
-    AromaImage *img = check_image(L, 1);
+    AromaImage *img = check_texture(L, 1);
     return set_filter(L, img->texture_id, &img->params);
 }
 
 static int l_image_getFilter(lua_State *L) {
-    return get_filter(L, &check_image(L, 1)->params);
+    return get_filter(L, &check_texture(L, 1)->params);
 }
 
 static int l_image_setWrap(lua_State *L) {
-    AromaImage *img = check_image(L, 1);
+    AromaImage *img = check_texture(L, 1);
     return set_wrap(L, img->texture_id, &img->params);
 }
 
 static int l_image_getWrap(lua_State *L) {
-    return get_wrap(L, &check_image(L, 1)->params);
+    return get_wrap(L, &check_texture(L, 1)->params);
 }
 
 /* Frees the texture now rather than whenever the collector gets to it. The
  * image draws nothing afterwards. Also the __gc */
 static int l_image_release(lua_State *L) {
-    AromaImage *img = check_image(L, 1);
+    AromaImage *img = check_texture(L, 1);
+    /* Releasing the canvas being drawn to goes back to the window. Only by
+     * hand, the collector can't reach a canvas while it's the target */
+    if (img == g_state.gfx.canvas) {
+        release_canvas_ref(L);
+        g_state.gfx.canvas = NULL;
+        apply_render_target();
+    }
     int had_texture = img->texture_id != 0;
     if (had_texture) {
         js_release_texture(img->texture_id);
@@ -1959,14 +2025,207 @@ static int l_mouse_isVisible(lua_State *L) {
     return 1;
 }
 
-static void setup_projection(float width, float height);
+static void setup_projection(float width, float height, int flip_y);
+
+/* A canvas is drawn into upside down so that its top row is the texture's
+ * first, the same way up as a loaded image */
+static void apply_render_target(void) {
+    if (!g_state.gl_context) {
+        return;
+    }
+
+    AromaImage *canvas = g_state.gfx.canvas;
+    int width = canvas ? canvas->width : g_state.window_width;
+    int height = canvas ? canvas->height : g_state.window_height;
+
+    js_bind_framebuffer(canvas ? canvas->texture_id : 0);
+    glViewport(0, 0, width, height);
+    setup_projection((float)width, (float)height, canvas != NULL);
+}
+
+/* The blend functions are love's, so that results match it */
+static void apply_blend_mode(void) {
+    if (!g_state.gl_context) {
+        return;
+    }
+
+    GLenum src_rgb = GL_ONE, src_a = GL_ONE, dst_rgb = GL_ZERO, dst_a = GL_ZERO;
+    GLenum equation = GL_FUNC_ADD;
+
+    switch (g_state.gfx.blend_mode) {
+        case BLEND_ALPHA:
+            dst_rgb = dst_a = GL_ONE_MINUS_SRC_ALPHA;
+            break;
+        case BLEND_MULTIPLY:
+            src_rgb = src_a = GL_DST_COLOR;
+            break;
+        case BLEND_REPLACE:
+            break;
+        case BLEND_SUBTRACT:
+            equation = GL_FUNC_REVERSE_SUBTRACT;
+            /* fall through */
+        case BLEND_ADD:
+            src_a = GL_ZERO;
+            dst_rgb = dst_a = GL_ONE;
+            break;
+        case BLEND_SCREEN:
+            dst_rgb = dst_a = GL_ONE_MINUS_SRC_COLOR;
+            break;
+    }
+
+    if (src_rgb == GL_ONE && g_state.gfx.blend_alpha == BLEND_ALPHA_MULTIPLY) {
+        src_rgb = GL_SRC_ALPHA;
+    }
+
+    glBlendEquation(equation);
+    glBlendFuncSeparate(src_rgb, dst_rgb, src_a, dst_a);
+}
 
 static void set_canvas_size(int width, int height) {
-    g_state.canvas_width = width;
-    g_state.canvas_height = height;
+    g_state.window_width = width;
+    g_state.window_height = height;
     emscripten_set_canvas_element_size("#canvas", width, height);
-    glViewport(0, 0, width, height);
-    setup_projection((float)width, (float)height);
+    apply_render_target();
+}
+
+static int l_graphics_setBlendMode(lua_State *L) {
+    BlendMode mode = (BlendMode)luaL_checkoption(L, 1, NULL, blend_mode_names);
+    BlendAlphaMode alpha = (BlendAlphaMode)luaL_checkoption(L, 2, "alphamultiply", blend_alpha_names);
+    if (mode == BLEND_MULTIPLY && alpha != BLEND_PREMULTIPLIED) {
+        return luaL_error(L, "love.graphics.setBlendMode: the multiply blend mode must be used with premultiplied alpha");
+    }
+    g_state.gfx.blend_mode = mode;
+    g_state.gfx.blend_alpha = alpha;
+    apply_blend_mode();
+    return 0;
+}
+
+static int l_graphics_getBlendMode(lua_State *L) {
+    lua_pushstring(L, blend_mode_names[g_state.gfx.blend_mode]);
+    lua_pushstring(L, blend_alpha_names[g_state.gfx.blend_alpha]);
+    return 2;
+}
+
+/* Starts out transparent black */
+static int l_graphics_newCanvas(lua_State *L) {
+    int width = (int)luaL_optinteger(L, 1, g_state.window_width);
+    int height = (int)luaL_optinteger(L, 2, g_state.window_height);
+    luaL_argcheck(L, width > 0, 1, "width must be positive");
+    luaL_argcheck(L, height > 0, 2, "height must be positive");
+
+    AromaImage *canvas = (AromaImage *)lua_newuserdata(L, sizeof(AromaImage));
+    memset(canvas, 0, sizeof(AromaImage));
+    default_texture_params(&canvas->params);
+    canvas->is_canvas = 1;
+    luaL_getmetatable(L, "aroma.canvas");
+    lua_setmetatable(L, -2);
+
+    canvas->texture_id = js_create_canvas(width, height);
+    if (!canvas->texture_id) {
+        return luaL_error(L, "love.graphics.newCanvas: failed to create a %dx%d canvas", width, height);
+    }
+    canvas->width = width;
+    canvas->height = height;
+    canvas->loaded = 1;
+    apply_texture_params(canvas->texture_id, &canvas->params);
+
+    /* Creating it bound its framebuffer */
+    apply_render_target();
+    return 1;
+}
+
+static void set_canvas(lua_State *L, int idx) {
+    AromaImage *canvas = NULL;
+    if (!lua_isnoneornil(L, idx)) {
+        canvas = (AromaImage *)luaL_checkudata(L, idx, "aroma.canvas");
+        if (!canvas->loaded) {
+            luaL_error(L, "love.graphics.setCanvas: the canvas has been released");
+        }
+    }
+
+    release_canvas_ref(L);
+    g_state.gfx.canvas = canvas;
+    if (canvas) {
+        lua_pushvalue(L, idx);
+        g_state.gfx.canvas_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    apply_render_target();
+}
+
+/* love's table form setCanvas({canvas, depth = ...}) is accepted, its
+ * options are ignored for now */
+static int l_graphics_setCanvas(lua_State *L) {
+    if (lua_istable(L, 1)) {
+        lua_rawgeti(L, 1, 1);
+        set_canvas(L, lua_gettop(L));
+        return 0;
+    }
+    set_canvas(L, 1);
+    return 0;
+}
+
+static int l_graphics_getCanvas(lua_State *L) {
+    if (g_state.gfx.canvas_ref == LUA_NOREF) {
+        lua_pushnil(L);
+    } else {
+        lua_rawgeti(L, LUA_REGISTRYINDEX, g_state.gfx.canvas_ref);
+    }
+    return 1;
+}
+
+/* Without a color this is transparent black as of love 11, not the
+ * background color */
+static int l_graphics_clear(lua_State *L) {
+    float color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (!lua_isnoneornil(L, 1)) {
+        parse_color(L, 1, color);
+    }
+
+    if (g_state.discard_rendering) {
+        return 0;
+    }
+
+    glClearColor(color[0], color[1], color[2], color[3]);
+    glClear(GL_COLOR_BUFFER_BIT);
+    return 0;
+}
+
+static int l_canvas_renderTo(lua_State *L) {
+    luaL_checkudata(L, 1, "aroma.canvas");
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+
+    l_graphics_getCanvas(L);              /* 3: previous target */
+    set_canvas(L, 1);
+
+    lua_pushvalue(L, 2);
+    int status = lua_pcall(L, 0, 0, 0);
+
+    set_canvas(L, 3);
+    if (status != LUA_OK) {
+        return lua_error(L);
+    }
+    return 0;
+}
+
+static int l_canvas_newImageData(lua_State *L) {
+    AromaImage *canvas = (AromaImage *)luaL_checkudata(L, 1, "aroma.canvas");
+    if (!canvas->loaded) {
+        return luaL_error(L, "the canvas has been released");
+    }
+
+    lua_settop(L, 1);
+    lua_pushcfunction(L, l_image_newImageData);
+    lua_pushinteger(L, canvas->width);
+    lua_pushinteger(L, canvas->height);
+    lua_call(L, 2, 1);
+    AromaImageData *data = check_image_data(L, 2);
+
+    /* Row 0 of the framebuffer is the canvas's top row, see apply_render_target */
+    js_bind_framebuffer(canvas->texture_id);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, canvas->width, canvas->height, GL_RGBA, GL_UNSIGNED_BYTE, data->pixels);
+    apply_render_target();
+    return 1;
 }
 
 /* The flags table is accepted and ignored. Fullscreen is asked for with a
@@ -1986,8 +2245,8 @@ static int l_window_setMode(lua_State *L) {
 }
 
 static int l_window_getMode(lua_State *L) {
-    lua_pushinteger(L, g_state.canvas_width);
-    lua_pushinteger(L, g_state.canvas_height);
+    lua_pushinteger(L, g_state.window_width);
+    lua_pushinteger(L, g_state.window_height);
     lua_newtable(L);
     return 3;
 }
@@ -2350,6 +2609,36 @@ static void register_aroma_api(lua_State *L) {
     }
     lua_pop(L, 1);
 
+    if (luaL_newmetatable(L, "aroma.canvas")) {
+        lua_pushcfunction(L, l_image_release);
+        lua_setfield(L, -2, "__gc");
+
+        lua_newtable(L);
+        lua_pushcfunction(L, l_image_getWidth);
+        lua_setfield(L, -2, "getWidth");
+        lua_pushcfunction(L, l_image_getHeight);
+        lua_setfield(L, -2, "getHeight");
+        lua_pushcfunction(L, l_image_getDimensions);
+        lua_setfield(L, -2, "getDimensions");
+        lua_pushcfunction(L, l_image_setFilter);
+        lua_setfield(L, -2, "setFilter");
+        lua_pushcfunction(L, l_image_getFilter);
+        lua_setfield(L, -2, "getFilter");
+        lua_pushcfunction(L, l_image_setWrap);
+        lua_setfield(L, -2, "setWrap");
+        lua_pushcfunction(L, l_image_getWrap);
+        lua_setfield(L, -2, "getWrap");
+        lua_pushcfunction(L, l_image_release);
+        lua_setfield(L, -2, "release");
+        lua_pushcfunction(L, l_canvas_renderTo);
+        lua_setfield(L, -2, "renderTo");
+        lua_pushcfunction(L, l_canvas_newImageData);
+        lua_setfield(L, -2, "newImageData");
+        register_object_type(L, (const char *const[]){"Canvas", "Texture", "Drawable", "Object", NULL});
+        lua_setfield(L, -2, "__index");
+    }
+    lua_pop(L, 1);
+
     if (luaL_newmetatable(L, "aroma.image_data")) {
         lua_pushcfunction(L, l_imagedata_release);
         lua_setfield(L, -2, "__gc");
@@ -2491,6 +2780,24 @@ static void register_aroma_api(lua_State *L) {
 
     lua_pushcfunction(L, l_graphics_newQuad);
     lua_setfield(L, -2, "newQuad");
+
+    lua_pushcfunction(L, l_graphics_newCanvas);
+    lua_setfield(L, -2, "newCanvas");
+
+    lua_pushcfunction(L, l_graphics_setCanvas);
+    lua_setfield(L, -2, "setCanvas");
+
+    lua_pushcfunction(L, l_graphics_getCanvas);
+    lua_setfield(L, -2, "getCanvas");
+
+    lua_pushcfunction(L, l_graphics_clear);
+    lua_setfield(L, -2, "clear");
+
+    lua_pushcfunction(L, l_graphics_setBlendMode);
+    lua_setfield(L, -2, "setBlendMode");
+
+    lua_pushcfunction(L, l_graphics_getBlendMode);
+    lua_setfield(L, -2, "getBlendMode");
 
     lua_pushcfunction(L, l_graphics_setDefaultFilter);
     lua_setfield(L, -2, "setDefaultFilter");
@@ -2868,13 +3175,15 @@ static int init_program(void) {
     return 1;
 }
 
-static void setup_projection(float width, float height) {
+/* Pixels with y down to clip space. flip_y leaves y pointing down in clip
+ * space too, which is up in a framebuffer's texture */
+static void setup_projection(float width, float height, int flip_y) {
     float *p = g_state.projection;
     memset(p, 0, sizeof(float) * 9);
     p[0] = 2.0f / width;
-    p[4] = -2.0f / height;
+    p[4] = flip_y ? 2.0f / height : -2.0f / height;
     p[6] = -1.0f;
-    p[7] = 1.0f;
+    p[7] = flip_y ? -1.0f : 1.0f;
     p[8] = 1.0f;
 }
 
@@ -2900,9 +3209,8 @@ static int init_webgl(void) {
 
     set_canvas_size(DEFAULT_WIDTH, DEFAULT_HEIGHT);
 
-    // Enable alpha blending for transparent images
     glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    apply_blend_mode();
 
     return 1;
 }
@@ -2914,6 +3222,13 @@ static void reset_graphics_state(void) {
         pop_stack_entry(g_state.L);
     }
     mat3_identity(&g_state.stack[0].matrix);
+
+    /* Likewise a canvas that was left set, the frame is drawn to the window */
+    if (g_state.gfx.canvas) {
+        release_canvas_ref(g_state.L);
+        g_state.gfx.canvas = NULL;
+        apply_render_target();
+    }
 }
 
 static void default_graphics_state(void) {
@@ -2924,6 +3239,10 @@ static void default_graphics_state(void) {
     gfx->line_width = 1.0f;
     gfx->font = NULL;
     gfx->font_ref = LUA_NOREF;
+    gfx->canvas = NULL;
+    gfx->canvas_ref = LUA_NOREF;
+    gfx->blend_mode = BLEND_ALPHA;
+    gfx->blend_alpha = BLEND_ALPHA_MULTIPLY;
     g_state.default_min = FILTER_LINEAR;
     g_state.default_mag = FILTER_LINEAR;
 
@@ -2931,6 +3250,9 @@ static void default_graphics_state(void) {
     memset(g_state.stack, 0, sizeof(g_state.stack));
     g_state.stack_top = 0;
     mat3_identity(&g_state.stack[0].matrix);
+
+    apply_render_target();
+    apply_blend_mode();
 }
 
 static void main_loop(void *userdata) {
@@ -2962,10 +3284,11 @@ static void main_loop(void *userdata) {
         return;
     }
 
+    reset_graphics_state();
+
     glClearColor(g_state.gfx.bg_color[0], g_state.gfx.bg_color[1], g_state.gfx.bg_color[2], g_state.gfx.bg_color[3]);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    reset_graphics_state();
     call_aroma_draw();
     finish_quit();
 }
@@ -2983,6 +3306,8 @@ static void close_lua_state(void) {
         return;
     }
 
+    /* Closing the state collects every canvas, none may count as in use */
+    g_state.gfx.canvas = NULL;
     lua_close(g_state.L);
     g_state.L = NULL;
     g_state.script_thread = NULL;

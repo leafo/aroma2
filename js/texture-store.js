@@ -55,6 +55,42 @@ export function createTextureStore(gl) {
     return id;
   }
 
+  // Leaves the new framebuffer bound
+  function createCanvas(width, height) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    const framebuffer = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.deleteFramebuffer(framebuffer);
+      gl.deleteTexture(tex);
+      return 0;
+    }
+
+    const id = nextId++;
+    textures.set(id, { tex, width, height, framebuffer });
+    return id;
+  }
+
+  // 0 or an id that isn't a canvas binds the window
+  function bindFramebuffer(id) {
+    const entry = textures.get(id);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, (entry && entry.framebuffer) || null);
+    // The shader always has a sampler, so a draw while the target's own
+    // texture is still bound counts as a feedback loop and is dropped, even
+    // for untextured shapes
+    gl.bindTexture(gl.TEXTURE_2D, null);
+  }
+
   function createFromSource(source, opts) {
     return createTextureFromSource(source, opts);
   }
@@ -100,6 +136,9 @@ export function createTextureStore(gl) {
   function release(id) {
     const entry = textures.get(id);
     if (!entry) return;
+    if (entry.framebuffer) {
+      gl.deleteFramebuffer(entry.framebuffer);
+    }
     gl.deleteTexture(entry.tex);
     textures.delete(id);
   }
@@ -108,6 +147,8 @@ export function createTextureStore(gl) {
     load,
     createFromSource,
     createFromPixels,
+    createCanvas,
+    bindFramebuffer,
     setParams,
     bind,
     release,

@@ -1,4 +1,5 @@
--- A tour of the timer, math, window, mouse, keyboard and shape APIs.
+-- A tour of the timer, math, window, mouse, keyboard, shape, text, image and
+-- canvas APIs.
 --
 --   mouse      move to aim the arc, the crosshair follows in canvas pixels
 --   click      left drops a dot, right clears them, a double click drops a big one
@@ -16,6 +17,7 @@ local g = love.graphics
 
 local font
 local image, image_quad
+local pixel_canvas
 local seed = 1
 local terrain = {}
 local dots = {}
@@ -45,6 +47,11 @@ function love.load()
   image = g.newImage("hi.png")
   local iw, ih = image:getDimensions()
   image_quad = g.newQuad(iw * 0.25, ih * 0.3, iw * 0.5, ih * 0.4, iw, ih)
+
+  -- a small canvas shown 3x with nearest filtering, the way a pixel art
+  -- game renders at its design size and scales up
+  pixel_canvas = g.newCanvas(96, 64)
+  pixel_canvas:setFilter("nearest", "nearest")
   love.window.setTitle("aroma playground")
   build_terrain()
 end
@@ -107,6 +114,29 @@ function love.quit()
   end
 end
 
+-- everything inside happens at the canvas's resolution
+local function draw_pixel_canvas()
+  g.push("all")
+  g.setCanvas(pixel_canvas)
+  g.clear(0.05, 0.05, 0.2, 1)
+
+  g.translate(48, 32)
+  g.setColor(1, 1, 1)
+  g.print("canvas", -22, -28)
+
+  -- lights adding up where they overlap
+  g.setBlendMode("add")
+  for i = 0, 2 do
+    local a = spin + i * math.pi * 2 / 3
+    local c = {0.2, 0.2, 0.2}
+    c[i + 1] = 1
+    g.setColor(c)
+    g.circle("fill", math.cos(a) * 12, 6 + math.sin(a) * 12, 16)
+  end
+  g.pop()
+  -- the pop put back the window as the target and the alpha blend mode
+end
+
 local function draw_spinner(x, y)
   g.push("all")
   g.translate(x, y)
@@ -167,7 +197,15 @@ function love.draw()
   local _, _, qw, qh = image_quad:getViewport()
   g.setColor(1, 1, 1)
   g.draw(image, image_quad, 130, 270, math.sin(spin * 0.5) * 0.1, 1.5, 1.5, qw / 2, qh / 2)
-  g.print(image:getFilter(), 40, 340)
+  g.print((image:getFilter()), 40, 340)
+
+  -- a canvas holds colors already multiplied by their alpha, so it's drawn
+  -- with the premultiplied alpha mode
+  draw_pixel_canvas()
+  g.setColor(1, 1, 1)
+  g.setBlendMode("alpha", "premultiplied")
+  g.draw(pixel_canvas, 250, 200, 0, 3, 3)
+  g.setBlendMode("alpha")
 
   for _, dot in ipairs(dots) do
     g.setColor(dot.color)

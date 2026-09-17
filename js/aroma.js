@@ -195,6 +195,18 @@ export async function initAroma(canvas) {
       return store ? store.createFromPixels(pixels, width, height) : 0;
     };
 
+    Module.createCanvasTexture = (width, height) => {
+      const store = ensureTextureStore(Module);
+      return store ? store.createCanvas(width, height) : 0;
+    };
+
+    Module.bindFramebuffer = (id) => {
+      const store = ensureTextureStore(Module);
+      if (store) {
+        store.bindFramebuffer(id);
+      }
+    };
+
     Module.setTextureParams = (id, minNearest, magNearest, wrapH, wrapV) => {
       const store = ensureTextureStore(Module);
       if (store) {
