@@ -13,7 +13,7 @@ local font
 local selected        -- Joystick being shown
 local pinned = false  -- true once tab has picked a pad by hand
 local log = {}
-local LOG_LINES = 14
+local LOG_LINES = 8
 
 -- how long a released button keeps a fading highlight, so taps are visible
 local FADE = 0.4
@@ -118,7 +118,9 @@ local function round_button(pad, name, x, y, radius, label)
   g.circle("line", x, y, radius)
   g.setColor(0, 0, 0)
   local text = label or name
-  g.print(text, x - font:getWidth(text) / 2, y - font:getHeight() / 2)
+  -- whole pixels: half of one puts every sample of a nearest filtered font
+  -- on the line between two texels
+  g.print(text, math.floor(x - font:getWidth(text) / 2), math.floor(y - font:getHeight() / 2))
 end
 
 local function box_button(pad, name, x, y, w, h, label)
@@ -128,7 +130,7 @@ local function box_button(pad, name, x, y, w, h, label)
   g.rectangle("line", x, y, w, h)
   g.setColor(1, 1, 1)
   local text = label or name
-  g.print(text, x + w / 2 - font:getWidth(text) / 2, y + h / 2 - font:getHeight() / 2)
+  g.print(text, math.floor(x + w / 2 - font:getWidth(text) / 2), math.floor(y + h / 2 - font:getHeight() / 2))
 end
 
 local function stick(pad, side, x, y)
@@ -212,33 +214,40 @@ local function draw_diagram(pad, x, y)
 end
 
 -- every button and axis by number, which is all an unmapped pad has
-local function draw_raw(pad, x, y)
+local function draw_raw_buttons(pad, x, y)
   g.setColor(1, 1, 1)
   g.print(("raw: %d buttons, %d axes, %d hats"):format(pad:getButtonCount(), pad:getAxisCount(), pad:getHatCount()), x, y)
 
+  local per_row = 16
   for i = 1, pad:getButtonCount() do
-    local col, row = (i - 1) % 12, math.floor((i - 1) / 12)
-    local bx, by = x + col * 36, y + 24 + row * 28
+    local col, row = (i - 1) % per_row, math.floor((i - 1) / per_row)
+    local bx, by = x + col * 27, y + 22 + row * 23
     set_glow(glow(pad:isDown(i), i))
-    g.rectangle("fill", bx, by, 32, 24)
+    g.rectangle("fill", bx, by, 25, 21)
     g.setColor(1, 1, 1)
-    g.print(tostring(i), bx + 16 - font:getWidth(tostring(i)) / 2, by + 4)
+    g.print(tostring(i), math.floor(bx + 13 - font:getWidth(tostring(i)) / 2), by + 2)
   end
 
-  local rows = math.ceil(pad:getButtonCount() / 12)
-  local ay = y + 32 + rows * 28
+  if pad:getHatCount() > 0 then
+    local rows = math.ceil(pad:getButtonCount() / per_row)
+    g.setColor(1, 1, 1)
+    g.print("hat 1: " .. pad:getHat(1), x, y + 28 + rows * 23)
+  end
+end
+
+local function draw_raw_axes(pad, x, y)
   for i, value in ipairs({pad:getAxes()}) do
-    local by = ay + (i - 1) * 20
+    local by = y + (i - 1) * 19
     g.setColor(1, 1, 1)
     g.print(("axis %d"):format(i), x, by)
     g.setColor(0.25, 0.25, 0.3)
-    g.rectangle("fill", x + 70, by + 2, 200, 12)
+    g.rectangle("fill", x + 66, by + 2, 160, 12)
     g.setColor(1, 0.8, 0.1)
-    g.rectangle("fill", x + 170, by + 2, value * 100, 12)
+    g.rectangle("fill", x + 146, by + 2, value * 80, 12)
     g.setColor(1, 1, 1, 0.5)
-    g.line(x + 170, by, x + 170, by + 16)
+    g.line(x + 146, by, x + 146, by + 16)
     g.setColor(1, 1, 1)
-    g.print(("%+.3f"):format(value), x + 280, by)
+    g.print(("%+.3f"):format(value), x + 236, by)
   end
 end
 
@@ -272,16 +281,18 @@ function love.draw()
   local top = 36 + #pads * 18 + 24
   if selected and selected:isConnected() then
     draw_diagram(selected, 16, top)
-    draw_raw(selected, 16, top + 316)
+    draw_raw_buttons(selected, 16, top + 316)
+    -- on the right under the log, where a long list has room to run down
+    draw_raw_axes(selected, 470, top + 36 + LOG_LINES * 18)
 
-    -- love's gamepad functions only answer for pads the browser maps to its
-    -- standard layout. For any other pad the diagram stays dark and only
-    -- the raw numbers underneath move
+    -- love's gamepad functions only answer for pads that the browser maps
+    -- to its standard layout or that there is an SDL mapping for. For any
+    -- other pad the diagram stays dark and only the raw numbers move
     if not selected:isGamepad() then
       g.setColor(0.09, 0.09, 0.12, 0.75)
       g.rectangle("fill", 16, top - 4, 440, 310)
       g.setColor(1, 0.8, 0.1)
-      g.printf("the browser has no standard mapping for this pad, so isGamepad is false and the named buttons and axes report nothing.\n\nthe raw buttons and axes below still work", 46, top + 100, 380, "center")
+      g.printf(("no mapping for this pad, so isGamepad is false and the named buttons and axes report nothing. the raw ones below still work.\n\nan SDL mapping for %s passed to love.joystick.loadGamepadMappings would map it"):format(selected:getGUID()), 46, top + 84, 380, "center")
     end
   end
 

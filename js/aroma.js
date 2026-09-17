@@ -5,9 +5,13 @@ import { createAudioStore } from './audio-store.js';
 /**
  * Initialize the Aroma WebAssembly runtime
  * @param {HTMLCanvasElement} canvas - The canvas element to render to
+ * @param {Object} [options]
+ * @param {boolean} [options.pixelPerfect=true] - Size the canvas's CSS box so
+ *   its pixels land on whole screen pixels. Turn off to lay the canvas out
+ *   with your own CSS, at the cost of the browser's smoothing when it scales
  * @returns {Promise<Object>} Promise that resolves with the initialized Aroma module
  */
-export async function initAroma(canvas) {
+export async function initAroma(canvas, options = {}) {
   if (!canvas) {
     throw new Error('Canvas element is required');
   }
@@ -239,6 +243,10 @@ export async function initAroma(canvas) {
   const Module = await wasmAromaModule(moduleConfig);
   console.log('Aroma WASM module loaded successfully');
 
+  if (options.pixelPerfect !== false) {
+    keepPixelPerfect(canvas, Module);
+  }
+
   const pressedKeys = new Set();
 
   Module.isKeyDown = (keyName) => {
@@ -434,4 +442,47 @@ export async function initAroma(canvas) {
       }
     }
   };
+}
+
+// A canvas is laid out in CSS pixels, which on a display scaled to say 1.25
+// aren't screen pixels: left alone, an 800 pixel canvas is stretched over
+// 1000 of them and smoothed. The CSS size is set so that every canvas pixel
+// covers a whole number of screen pixels instead, 1 up to a ratio of 1.5, 2
+// from there. The canvas looks smaller than its size in CSS pixels as a
+// result, which is what a desktop window of that size looks like too.
+//
+// The size isn't enough. Centering and the like put the canvas at a fraction
+// of a screen pixel, and then it's resampled all the same, so it is also
+// nudged onto the screen's pixel grid.
+function keepPixelPerfect(canvas, Module) {
+  let watched = null;
+
+  function apply() {
+    const ratio = window.devicePixelRatio || 1;
+    const scale = Math.max(1, Math.round(ratio)) / ratio;
+    canvas.style.width = `${canvas.width * scale}px`;
+    canvas.style.height = `${canvas.height * scale}px`;
+    // Only matters when a canvas pixel covers more than one screen pixel
+    canvas.style.imageRendering = 'pixelated';
+
+    canvas.style.transform = 'none';
+    const rect = canvas.getBoundingClientRect();
+    const nudge = (at) => (Math.round(at * ratio) - at * ratio) / ratio;
+    canvas.style.transform = `translate(${nudge(rect.left)}px, ${nudge(rect.top)}px)`;
+
+    // The ratio changes with browser zoom and when the window moves to
+    // another display. A resolution query only fires on leaving the ratio it
+    // names, so it's made again each time
+    if (watched) watched.removeEventListener('change', apply);
+    watched = window.matchMedia(`(resolution: ${ratio}dppx)`);
+    watched.addEventListener('change', apply);
+  }
+
+  Module.onCanvasResized = apply;
+  // Whatever moves the canvas on the page can take it off the grid again
+  window.addEventListener('resize', apply);
+  if (window.ResizeObserver && canvas.parentElement) {
+    new ResizeObserver(apply).observe(canvas.parentElement);
+  }
+  apply();
 }

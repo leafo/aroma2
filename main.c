@@ -72,12 +72,52 @@ typedef struct {
  * count, axis count, then pressed flags, analog button values and axes */
 #define JOYSTICK_STAGING_FLOATS (4 + MAX_JOYSTICK_BUTTONS * 2 + MAX_JOYSTICK_AXES)
 
+#define GAMEPAD_BUTTONS 15
+#define GAMEPAD_AXES 6
+#define GAMEPAD_STICK_AXES 4
+#define MAX_GAMEPAD_MAPPINGS 64
+
+/* Where one of love's named gamepad inputs comes from in a pad's raw state */
+typedef enum { BIND_NONE, BIND_BUTTON, BIND_AXIS, BIND_HAT } BindType;
+
+typedef struct {
+    BindType type;
+    /* Raw button or axis from 0, or the hat */
+    int index;
+    /* BIND_HAT: the direction, 1 up 2 right 4 down 8 left as in SDL */
+    int hat_mask;
+    /* BIND_AXIS: the stretch of the raw axis that is used, from rest to full.
+     * A whole axis is -1 to 1, SDL's +a2 is 0 to 1 and a2~ is 1 to -1 */
+    float from;
+    float to;
+} Binding;
+
+/* An SDL style mapping from raw inputs to the gamepad layout, for pads the
+ * browser doesn't map itself. They're matched to pads by USB ids */
+typedef struct {
+    int vendor;
+    int product;
+    Binding buttons[GAMEPAD_BUTTONS];
+    Binding axes[GAMEPAD_AXES];
+} GamepadMapping;
+
 /* A slot of navigator.getGamepads(). The state is diffed against what the
  * page reports each frame to send love's joystick callbacks */
 typedef struct {
     int connected;
-    /* The browser's "standard" mapping, which is what makes it a Gamepad */
-    int mapped;
+    /* What makes it a Gamepad: the browser's "standard" layout, or else a
+     * mapping of ours for its USB ids. NULL for a plain joystick */
+    const GamepadMapping *mapping;
+    int vendor;
+    int product;
+    /* Set when the mapping reads a hat, which browsers deliver as the last
+     * two axes. They're then reported as a hat and not as axes, like SDL */
+    int has_hat;
+    /* Axes that have moved. Browsers report 0 for an axis until its first
+     * event, which for a trigger resting at -1 would read as half pulled */
+    uint32_t axes_seen;
+    uint32_t gamepad_pressed;
+    float gamepad_axes[GAMEPAD_AXES];
     /* Tells apart pads that come and go in one slot, a Joystick object is
      * only live while its id matches */
     int instance_id;
@@ -230,6 +270,10 @@ typedef struct {
     int mouse_hidden;
     float master_volume;
     JoystickSlot joysticks[MAX_JOYSTICKS];
+    /* Mappings the script added with setGamepadMapping or
+     * loadGamepadMappings, looked up before the built in ones */
+    GamepadMapping user_mappings[MAX_GAMEPAD_MAPPINGS];
+    int user_mapping_count;
     int next_joystick_instance;
     /* Off by default like love: held keys send one keypressed */
     int key_repeat;
@@ -260,8 +304,14 @@ static const char *vertex_shader_source =
     "  vTexCoord = aTexCoord;\n"
     "}\n";
 
+/* mediump can be 16 bits, too few to tell the texels of a wide texture apart:
+ * glyphs from a long font strip come out mangled */
 static const char *fragment_shader_source =
+    "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+    "precision highp float;\n"
+    "#else\n"
     "precision mediump float;\n"
+    "#endif\n"
     "uniform vec4 uColor;\n"
     "uniform sampler2D uTexture;\n"
     "uniform int uUseTexture;\n"
@@ -385,6 +435,17 @@ EM_JS(void, js_poll_gamepads, (float *staging, int slots, int slot_floats, int m
   }
 });
 
+/* Raw button and axis numbers differ by operating system, so SDL's mappings
+ * each name the one they're for. 0 Linux, 1 Windows, 2 Mac OS X, -1 other */
+EM_JS(int, js_gamepad_platform, (void), {
+  const ua = navigator.userAgent || "";
+  if (/Android/.test(ua)) return -1;
+  if (/Linux|CrOS/.test(ua)) return 0;
+  if (/Windows/.test(ua)) return 1;
+  if (/Mac OS X|Macintosh/.test(ua)) return 2;
+  return -1;
+});
+
 EM_JS(void, js_gamepad_name, (int slot, char *buffer, int size), {
   const pad = navigator.getGamepads ? navigator.getGamepads()[slot] : null;
   stringToUTF8(pad ? pad.id : "", buffer, size);
@@ -496,6 +557,12 @@ EM_JS(void, js_set_title, (const char *title), {
     Module.setTitle(text);
   } else {
     document.title = text;
+  }
+});
+
+EM_JS(void, js_canvas_resized, (void), {
+  if (Module.onCanvasResized) {
+    Module.onCanvasResized();
   }
 });
 
@@ -2466,20 +2533,276 @@ static int l_audio_stop(lua_State *L) {
     return 0;
 }
 
-/* The standard mapping's button order. Its triggers, buttons 6 and 7, are
- * axes in love and have no button name */
-static const char *const gamepad_button_names[] = {
-    "a", "b", "x", "y", "leftshoulder", "rightshoulder", NULL, NULL,
-    "back", "start", "leftstick", "rightstick",
-    "dpup", "dpdown", "dpleft", "dpright", "guide"
+static const char *const gamepad_button_names[GAMEPAD_BUTTONS + 1] = {
+    "a", "b", "x", "y", "back", "guide", "start", "leftstick", "rightstick",
+    "leftshoulder", "rightshoulder", "dpup", "dpdown", "dpleft", "dpright", NULL
 };
-#define GAMEPAD_BUTTON_NAMES ((int)(sizeof(gamepad_button_names) / sizeof(gamepad_button_names[0])))
 
-static const char *const gamepad_axis_names[] = {
+static const char *const gamepad_axis_names[GAMEPAD_AXES + 1] = {
     "leftx", "lefty", "rightx", "righty", "triggerleft", "triggerright", NULL
 };
-#define GAMEPAD_STICK_AXES 4
-#define GAMEPAD_TRIGGER_LEFT_BUTTON 6
+
+/* SDL's mapping strings call the triggers something else */
+static const char *const sdl_axis_names[GAMEPAD_AXES] = {
+    "leftx", "lefty", "rightx", "righty", "lefttrigger", "righttrigger"
+};
+
+#define B(n) {BIND_BUTTON, n, 0, 0.0f, 0.0f}
+#define A(n) {BIND_AXIS, n, 0, -1.0f, 1.0f}
+
+/* The Gamepad API's "standard" layout. Its triggers are buttons 6 and 7,
+ * whose analog value is the axis */
+static const GamepadMapping standard_mapping = {
+    0, 0,
+    {B(0), B(1), B(2), B(3), B(8), B(16), B(9), B(10), B(11), B(4), B(5), B(12), B(13), B(14), B(15)},
+    {A(0), A(1), A(2), A(3), B(6), B(7)}
+};
+
+#undef B
+#undef A
+
+/* Mappings for pads that browsers are known to leave unmapped, in SDL's
+ * format. Scripts add their own with love.joystick.loadGamepadMappings */
+static const char *const builtin_mapping_strings[] = {
+    "0300c27e373500002210000010010000,GameSir-G7 Pro,a:b0,b:b1,x:b3,y:b4,back:b10,guide:b12,start:b11,leftstick:b13,rightstick:b14,leftshoulder:b6,rightshoulder:b7,dpup:h0.1,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,leftx:a0,lefty:a1,rightx:a2,righty:a3,lefttrigger:a5,righttrigger:a4,platform:Linux,",
+    NULL
+};
+
+static GamepadMapping g_builtin_mappings[sizeof(builtin_mapping_strings) / sizeof(builtin_mapping_strings[0])];
+static int g_builtin_mapping_count = -1;
+
+static int hex_digit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* A 16 bit little endian field of an SDL GUID, which is 32 hex digits. The
+ * vendor is at digit 8 and the product at 16 */
+static int guid_field(const char *guid, int at) {
+    int digits[4];
+    for (int i = 0; i < 4; i++) {
+        digits[i] = hex_digit(guid[at + i]);
+        if (digits[i] < 0) return -1;
+    }
+    return (digits[2] << 12) | (digits[3] << 8) | (digits[0] << 4) | digits[1];
+}
+
+static int parse_guid(const char *guid, size_t length, int *vendor, int *product) {
+    if (length != 32) {
+        return 0;
+    }
+    *vendor = guid_field(guid, 8);
+    *product = guid_field(guid, 16);
+    return *vendor > 0 && *product >= 0;
+}
+
+/* One value of a mapping string: b3, a2, +a2, -a2, a2~ or h0.4 */
+static int parse_binding(const char *value, size_t length, Binding *out) {
+    char text[16];
+    if (length == 0 || length >= sizeof(text)) {
+        return 0;
+    }
+    memcpy(text, value, length);
+    text[length] = '\0';
+
+    const char *ptr = text;
+    float from = -1.0f, to = 1.0f;
+    if (*ptr == '+') { from = 0.0f; ptr++; }
+    else if (*ptr == '-') { from = 0.0f; to = -1.0f; ptr++; }
+
+    char kind = *ptr++;
+    char *end;
+    long index = strtol(ptr, &end, 10);
+    if (end == ptr || index < 0) {
+        return 0;
+    }
+
+    memset(out, 0, sizeof(Binding));
+    out->index = (int)index;
+
+    if (kind == 'b' && index < MAX_JOYSTICK_BUTTONS) {
+        out->type = BIND_BUTTON;
+    } else if (kind == 'a' && index < MAX_JOYSTICK_AXES) {
+        out->type = BIND_AXIS;
+        if (*end == '~') {
+            float swap = from; from = to; to = swap;
+        }
+        out->from = from;
+        out->to = to;
+    } else if (kind == 'h' && *end == '.') {
+        out->type = BIND_HAT;
+        out->hat_mask = (int)strtol(end + 1, NULL, 10);
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
+/* Parses one line of SDL's gamecontrollerdb format. Returns 0 for lines that
+ * aren't mappings or that are for another platform */
+static int parse_mapping_line(const char *line, size_t length, GamepadMapping *out) {
+    static const char *const platforms[] = {"Linux", "Windows", "Mac OS X"};
+
+    const char *end = line + length;
+    const char *comma = memchr(line, ',', length);
+    if (!comma) {
+        return 0;
+    }
+
+    memset(out, 0, sizeof(GamepadMapping));
+    if (!parse_guid(line, (size_t)(comma - line), &out->vendor, &out->product)) {
+        return 0;
+    }
+
+    /* Skip the name */
+    const char *field = memchr(comma + 1, ',', (size_t)(end - comma - 1));
+    while (field && field + 1 < end) {
+        field++;
+        const char *next = memchr(field, ',', (size_t)(end - field));
+        const char *field_end = next ? next : end;
+        const char *colon = memchr(field, ':', (size_t)(field_end - field));
+
+        if (colon) {
+            size_t key_len = (size_t)(colon - field);
+            const char *value = colon + 1;
+            size_t value_len = (size_t)(field_end - value);
+
+            if (key_len == 8 && memcmp(field, "platform", 8) == 0) {
+                int platform = js_gamepad_platform();
+                if (platform < 0 || strlen(platforms[platform]) != value_len ||
+                    memcmp(platforms[platform], value, value_len) != 0) {
+                    return 0;
+                }
+            }
+
+            for (int i = 0; i < GAMEPAD_BUTTONS; i++) {
+                if (strlen(gamepad_button_names[i]) == key_len && memcmp(gamepad_button_names[i], field, key_len) == 0) {
+                    parse_binding(value, value_len, &out->buttons[i]);
+                }
+            }
+            for (int i = 0; i < GAMEPAD_AXES; i++) {
+                if (strlen(sdl_axis_names[i]) == key_len && memcmp(sdl_axis_names[i], field, key_len) == 0) {
+                    parse_binding(value, value_len, &out->axes[i]);
+                }
+            }
+        }
+
+        field = next;
+    }
+    return 1;
+}
+
+static const GamepadMapping *find_mapping(int vendor, int product) {
+    if (vendor <= 0) {
+        return NULL;
+    }
+
+    if (g_builtin_mapping_count < 0) {
+        g_builtin_mapping_count = 0;
+        for (int i = 0; builtin_mapping_strings[i]; i++) {
+            const char *line = builtin_mapping_strings[i];
+            if (parse_mapping_line(line, strlen(line), &g_builtin_mappings[g_builtin_mapping_count])) {
+                g_builtin_mapping_count++;
+            }
+        }
+    }
+
+    for (int i = 0; i < g_state.user_mapping_count; i++) {
+        const GamepadMapping *mapping = &g_state.user_mappings[i];
+        if (mapping->vendor == vendor && mapping->product == product) return mapping;
+    }
+    for (int i = 0; i < g_builtin_mapping_count; i++) {
+        const GamepadMapping *mapping = &g_builtin_mappings[i];
+        if (mapping->vendor == vendor && mapping->product == product) return mapping;
+    }
+    return NULL;
+}
+
+/* The user mapping for these ids, added if there is room */
+static GamepadMapping *user_mapping_for(int vendor, int product) {
+    for (int i = 0; i < g_state.user_mapping_count; i++) {
+        GamepadMapping *mapping = &g_state.user_mappings[i];
+        if (mapping->vendor == vendor && mapping->product == product) return mapping;
+    }
+    if (g_state.user_mapping_count >= MAX_GAMEPAD_MAPPINGS) {
+        return NULL;
+    }
+    GamepadMapping *mapping = &g_state.user_mappings[g_state.user_mapping_count++];
+    memset(mapping, 0, sizeof(GamepadMapping));
+    mapping->vendor = vendor;
+    mapping->product = product;
+    return mapping;
+}
+
+static int mapping_has_hat(const GamepadMapping *mapping) {
+    for (int i = 0; i < GAMEPAD_BUTTONS; i++) {
+        if (mapping->buttons[i].type == BIND_HAT) return 1;
+    }
+    return 0;
+}
+
+/* Picks the mapping for a pad, again whenever the script changes them */
+static void assign_mapping(JoystickSlot *slot, int browser_mapped) {
+    slot->mapping = browser_mapped ? &standard_mapping : find_mapping(slot->vendor, slot->product);
+    slot->has_hat = slot->mapping && mapping_has_hat(slot->mapping);
+}
+
+/* SDL's hat bits from the two axes the hat arrives as */
+static int joystick_hat(const JoystickSlot *slot) {
+    if (!slot->has_hat || slot->axis_count < 2) {
+        return 0;
+    }
+    float x = slot->axes[slot->axis_count - 2];
+    float y = slot->axes[slot->axis_count - 1];
+    return (y < -0.5f ? 1 : 0) | (x > 0.5f ? 2 : 0) | (y > 0.5f ? 4 : 0) | (x < -0.5f ? 8 : 0);
+}
+
+/* 0 to 1 along the stretch of the raw axis that the binding uses */
+static float binding_axis_travel(const JoystickSlot *slot, const Binding *binding) {
+    if (binding->index >= slot->axis_count || !(slot->axes_seen & (1u << binding->index))) {
+        return 0.0f;
+    }
+    float travel = (slot->axes[binding->index] - binding->from) / (binding->to - binding->from);
+    return travel < 0.0f ? 0.0f : travel > 1.0f ? 1.0f : travel;
+}
+
+static int gamepad_button_down(const JoystickSlot *slot, int button) {
+    const Binding *binding = &slot->mapping->buttons[button];
+    switch (binding->type) {
+        case BIND_BUTTON:
+            return binding->index < slot->button_count && ((slot->pressed >> binding->index) & 1);
+        case BIND_AXIS:
+            return binding_axis_travel(slot, binding) > 0.5f;
+        case BIND_HAT:
+            return (joystick_hat(slot) & binding->hat_mask) != 0;
+        default:
+            return 0;
+    }
+}
+
+static float gamepad_axis_value(const JoystickSlot *slot, int axis) {
+    const Binding *binding = &slot->mapping->axes[axis];
+    int is_trigger = axis >= GAMEPAD_STICK_AXES;
+
+    switch (binding->type) {
+        case BIND_BUTTON:
+            if (binding->index >= slot->button_count) return 0.0f;
+            return slot->values[binding->index];
+        case BIND_AXIS: {
+            if (binding->index >= slot->axis_count) return 0.0f;
+            int whole = fabsf(binding->to - binding->from) == 2.0f;
+            if (!is_trigger && whole) {
+                /* A stick on a whole axis passes through, flipped for a2~ */
+                return binding->to > binding->from ? slot->axes[binding->index] : -slot->axes[binding->index];
+            }
+            return binding_axis_travel(slot, binding);
+        }
+        default:
+            return 0.0f;
+    }
+}
 
 static AromaJoystick *check_joystick(lua_State *L, int idx) {
     return (AromaJoystick *)luaL_checkudata(L, idx, "aroma.joystick");
@@ -2515,13 +2838,6 @@ static int l_joystick_getJoystickCount(lua_State *L) {
     return 1;
 }
 
-/* The browser decides the mapping, there is nothing to set. Says so by
- * returning false */
-static int l_joystick_setGamepadMapping(lua_State *L) {
-    lua_pushboolean(L, 0);
-    return 1;
-}
-
 static int l_joystick_isConnected(lua_State *L) {
     lua_pushboolean(L, live_joystick(L, 1) != NULL);
     return 1;
@@ -2546,13 +2862,18 @@ static int l_joystick_getID(lua_State *L) {
 
 static int l_joystick_isGamepad(lua_State *L) {
     JoystickSlot *slot = live_joystick(L, 1);
-    lua_pushboolean(L, slot && slot->mapped);
+    lua_pushboolean(L, slot && slot->mapping);
     return 1;
+}
+
+/* Without the two axes that are reported as the hat */
+static int joystick_axis_count(const JoystickSlot *slot) {
+    return slot->has_hat && slot->axis_count >= 2 ? slot->axis_count - 2 : slot->axis_count;
 }
 
 static int l_joystick_getAxisCount(lua_State *L) {
     JoystickSlot *slot = live_joystick(L, 1);
-    lua_pushinteger(L, slot ? slot->axis_count : 0);
+    lua_pushinteger(L, slot ? joystick_axis_count(slot) : 0);
     return 1;
 }
 
@@ -2562,29 +2883,45 @@ static int l_joystick_getButtonCount(lua_State *L) {
     return 1;
 }
 
-/* Browsers report a dpad as buttons or axes, never as a hat */
 static int l_joystick_getHatCount(lua_State *L) {
-    check_joystick(L, 1);
-    lua_pushinteger(L, 0);
+    JoystickSlot *slot = live_joystick(L, 1);
+    lua_pushinteger(L, slot && slot->has_hat ? 1 : 0);
     return 1;
 }
 
 static int l_joystick_getHat(lua_State *L) {
-    check_joystick(L, 1);
-    lua_pushliteral(L, "c");
+    static const char *const directions[16] = {
+        "c", "u", "r", "ru", "d", "c", "rd", "c", "l", "lu", "c", "c", "ld", "c", "c", "c"
+    };
+    JoystickSlot *slot = live_joystick(L, 1);
+    int hat = (int)luaL_checkinteger(L, 2);
+    lua_pushstring(L, slot && hat == 1 ? directions[joystick_hat(slot)] : "c");
+    return 1;
+}
+
+/* A made up SDL GUID carrying the pad's USB ids, which is the part that
+ * mappings are matched by. Pads whose ids the browser hides get zeros */
+static int l_joystick_getGUID(lua_State *L) {
+    JoystickSlot *slot = live_joystick(L, 1);
+    int vendor = slot ? slot->vendor : 0;
+    int product = slot ? slot->product : 0;
+    char guid[33];
+    snprintf(guid, sizeof(guid), "03000000%02x%02x0000%02x%02x000000000000",
+             vendor & 0xff, (vendor >> 8) & 0xff, product & 0xff, (product >> 8) & 0xff);
+    lua_pushstring(L, guid);
     return 1;
 }
 
 static int l_joystick_getAxis(lua_State *L) {
     JoystickSlot *slot = live_joystick(L, 1);
     int axis = (int)luaL_checkinteger(L, 2);
-    lua_pushnumber(L, slot && axis >= 1 && axis <= slot->axis_count ? slot->axes[axis - 1] : 0.0);
+    lua_pushnumber(L, slot && axis >= 1 && axis <= joystick_axis_count(slot) ? slot->axes[axis - 1] : 0.0);
     return 1;
 }
 
 static int l_joystick_getAxes(lua_State *L) {
     JoystickSlot *slot = live_joystick(L, 1);
-    int count = slot ? slot->axis_count : 0;
+    int count = slot ? joystick_axis_count(slot) : 0;
     luaL_checkstack(L, count, "too many axes");
     for (int i = 0; i < count; i++) {
         lua_pushnumber(L, slot->axes[i]);
@@ -2612,17 +2949,8 @@ static int l_joystick_isGamepadDown(lua_State *L) {
     int nargs = lua_gettop(L);
     int down = 0;
     for (int i = 2; i <= nargs; i++) {
-        const char *name = luaL_checkstring(L, i);
-        int button = -1;
-        for (int b = 0; b < GAMEPAD_BUTTON_NAMES; b++) {
-            if (gamepad_button_names[b] && strcmp(gamepad_button_names[b], name) == 0) {
-                button = b;
-            }
-        }
-        if (button < 0) {
-            return luaL_error(L, "Invalid gamepad button: %s", name);
-        }
-        if (slot && slot->mapped && (slot->pressed & (1u << button))) {
+        int button = luaL_checkoption(L, i, NULL, gamepad_button_names);
+        if (slot && slot->mapping && gamepad_button_down(slot, button)) {
             down = 1;
         }
     }
@@ -2630,18 +2958,104 @@ static int l_joystick_isGamepadDown(lua_State *L) {
     return 1;
 }
 
-static float gamepad_axis_value(const JoystickSlot *slot, int axis) {
-    if (axis < GAMEPAD_STICK_AXES) {
-        return axis < slot->axis_count ? slot->axes[axis] : 0.0f;
-    }
-    return slot->values[GAMEPAD_TRIGGER_LEFT_BUTTON + axis - GAMEPAD_STICK_AXES];
-}
-
 static int l_joystick_getGamepadAxis(lua_State *L) {
     JoystickSlot *slot = live_joystick(L, 1);
     int axis = luaL_checkoption(L, 2, NULL, gamepad_axis_names);
-    lua_pushnumber(L, slot && slot->mapped ? gamepad_axis_value(slot, axis) : 0.0);
+    lua_pushnumber(L, slot && slot->mapping ? gamepad_axis_value(slot, axis) : 0.0);
     return 1;
+}
+
+static void reassign_mappings(void) {
+    for (int i = 0; i < MAX_JOYSTICKS; i++) {
+        JoystickSlot *slot = &g_state.joysticks[i];
+        if (slot->connected && slot->mapping != &standard_mapping) {
+            assign_mapping(slot, 0);
+        }
+    }
+}
+
+/* setGamepadMapping(guid, button or axis, inputtype, inputindex, [hatdir]).
+ * Only reaches pads that the browser hasn't mapped itself */
+static int l_joystick_setGamepadMapping(lua_State *L) {
+    static const char *const input_types[] = {"button", "axis", "hat", NULL};
+    static const char *const hat_dirs[] = {"u", "r", "d", "l", NULL};
+
+    size_t guid_len;
+    const char *guid = luaL_checklstring(L, 1, &guid_len);
+    const char *target = luaL_checkstring(L, 2);
+    int input_type = luaL_checkoption(L, 3, NULL, input_types);
+    int index = (int)luaL_checkinteger(L, 4) - 1;
+    luaL_argcheck(L, index >= 0, 4, "inputs count from 1");
+
+    Binding binding;
+    memset(&binding, 0, sizeof(binding));
+    binding.index = index;
+    if (input_type == 0) {
+        luaL_argcheck(L, index < MAX_JOYSTICK_BUTTONS, 4, "button out of range");
+        binding.type = BIND_BUTTON;
+    } else if (input_type == 1) {
+        luaL_argcheck(L, index < MAX_JOYSTICK_AXES, 4, "axis out of range");
+        binding.type = BIND_AXIS;
+        binding.from = -1.0f;
+        binding.to = 1.0f;
+    } else {
+        binding.type = BIND_HAT;
+        binding.hat_mask = 1 << luaL_checkoption(L, 5, NULL, hat_dirs);
+    }
+
+    int vendor, product;
+    GamepadMapping *mapping = parse_guid(guid, guid_len, &vendor, &product) ? user_mapping_for(vendor, product) : NULL;
+    if (!mapping) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
+    int found = 0;
+    for (int i = 0; i < GAMEPAD_BUTTONS; i++) {
+        if (strcmp(gamepad_button_names[i], target) == 0) { mapping->buttons[i] = binding; found = 1; }
+    }
+    for (int i = 0; i < GAMEPAD_AXES; i++) {
+        if (strcmp(gamepad_axis_names[i], target) == 0) { mapping->axes[i] = binding; found = 1; }
+    }
+    if (!found) {
+        return luaL_error(L, "Invalid gamepad axis/button: %s", target);
+    }
+
+    reassign_mappings();
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* loadGamepadMappings(text) in SDL's gamecontrollerdb format. Mappings for
+ * other platforms are skipped, the raw numbering differs between them */
+static int l_joystick_loadGamepadMappings(lua_State *L) {
+    size_t length;
+    const char *text = luaL_checklstring(L, 1, &length);
+    if (!memchr(text, ',', length)) {
+        return luaL_error(L, "love.joystick.loadGamepadMappings: loading from a file isn't supported yet, pass the mappings as a string");
+    }
+
+    const char *end = text + length;
+    while (text < end) {
+        const char *newline = memchr(text, '\n', (size_t)(end - text));
+        const char *line_end = newline ? newline : end;
+        size_t line_len = (size_t)(line_end - text);
+        if (line_len > 0 && line_end[-1] == '\r') {
+            line_len--;
+        }
+
+        GamepadMapping parsed;
+        if (line_len > 0 && text[0] != '#' && parse_mapping_line(text, line_len, &parsed)) {
+            GamepadMapping *mapping = user_mapping_for(parsed.vendor, parsed.product);
+            if (mapping) {
+                *mapping = parsed;
+            }
+        }
+        text = line_end + 1;
+    }
+
+    reassign_mappings();
+    return 0;
 }
 
 static int l_keyboard_setKeyRepeat(lua_State *L) {
@@ -2834,6 +3248,7 @@ static void set_canvas_size(int width, int height) {
     g_state.window_width = width;
     g_state.window_height = height;
     emscripten_set_canvas_element_size("#canvas", width, height);
+    js_canvas_resized();
     apply_render_target();
 }
 
@@ -3398,6 +3813,7 @@ static void register_aroma_api(lua_State *L) {
             {"getButtonCount", l_joystick_getButtonCount},
             {"getHatCount", l_joystick_getHatCount},
             {"getHat", l_joystick_getHat},
+            {"getGUID", l_joystick_getGUID},
             {"getAxis", l_joystick_getAxis},
             {"getAxes", l_joystick_getAxes},
             {"isDown", l_joystick_isDown},
@@ -3687,6 +4103,8 @@ static void register_aroma_api(lua_State *L) {
     lua_setfield(L, -2, "getJoystickCount");
     lua_pushcfunction(L, l_joystick_setGamepadMapping);
     lua_setfield(L, -2, "setGamepadMapping");
+    lua_pushcfunction(L, l_joystick_loadGamepadMappings);
+    lua_setfield(L, -2, "loadGamepadMappings");
     lua_setfield(L, -2, "joystick"); /* aroma.joystick = table */
 
     lua_newtable(L);                /* aroma.audio */
@@ -4211,6 +4629,7 @@ static void close_lua_state(void) {
     js_audio_set_master_volume(1.0);
     /* The next run finds the pads again and gets a joystickadded for each */
     memset(g_state.joysticks, 0, sizeof(g_state.joysticks));
+    g_state.user_mapping_count = 0;
 }
 
 static int quit_aborted(void) {
@@ -4322,6 +4741,34 @@ static void call_joystick_event(const char *name, JoystickSlot *slot, const char
     finish_quit();
 }
 
+/* Browsers put the USB ids in the pad's name: Chrome and Safari append
+ * "(... Vendor: 3537 Product: 1022)", which is taken off the name again, and
+ * Firefox leads with "3537-1022-" */
+static void read_usb_ids(JoystickSlot *slot) {
+    unsigned int vendor = 0, product = 0;
+
+    char *tag = strstr(slot->name, "Vendor: ");
+    if (tag && sscanf(tag, "Vendor: %4x Product: %4x", &vendor, &product) == 2) {
+        char *paren = tag;
+        while (paren > slot->name && *paren != '(') paren--;
+        if (*paren == '(') {
+            while (paren > slot->name && paren[-1] == ' ') paren--;
+            *paren = '\0';
+        }
+    } else {
+        char rest;
+        if (sscanf(slot->name, "%4x-%4x-%c", &vendor, &product, &rest) == 3) {
+            char *name = strchr(strchr(slot->name, '-') + 1, '-') + 1;
+            memmove(slot->name, name, strlen(name) + 1);
+        } else {
+            vendor = product = 0;
+        }
+    }
+
+    slot->vendor = (int)vendor;
+    slot->product = (int)product;
+}
+
 static float g_joystick_staging[MAX_JOYSTICKS * JOYSTICK_STAGING_FLOATS];
 
 /* Takes in the state of the pads for this frame and sends the callbacks for
@@ -4359,9 +4806,12 @@ static void poll_joysticks(void) {
         if (!slot->connected) {
             memset(slot, 0, sizeof(JoystickSlot));
             slot->connected = 1;
-            slot->mapped = in[1] != 0.0f;
             slot->instance_id = ++g_state.next_joystick_instance;
+            slot->button_count = (int)in[2];
+            slot->axis_count = (int)in[3];
             js_gamepad_name(i, slot->name, sizeof(slot->name));
+            read_usb_ids(slot);
+            assign_mapping(slot, in[1] != 0.0f);
 
             AromaJoystick *joystick = (AromaJoystick *)lua_newuserdata(L, sizeof(AromaJoystick));
             joystick->slot = i;
@@ -4370,8 +4820,6 @@ static void poll_joysticks(void) {
             lua_setmetatable(L, -2);
             slot->object_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
-            slot->button_count = (int)in[2];
-            slot->axis_count = (int)in[3];
             call_joystick_event("joystickadded", slot, NULL, 0, 0, 0.0f);
             if (g_state.L != L) return;
         }
@@ -4379,38 +4827,58 @@ static void poll_joysticks(void) {
         slot->button_count = (int)in[2];
         slot->axis_count = (int)in[3];
 
+        /* Take in the whole raw state first so that the callbacks below all
+         * see the same frame */
+        uint32_t was_pressed = slot->pressed;
+        float old_axes[MAX_JOYSTICK_AXES];
+        memcpy(old_axes, slot->axes, sizeof(old_axes));
+
+        slot->pressed = 0;
+        for (int b = 0; b < slot->button_count; b++) {
+            slot->values[b] = in_values[b];
+            if (in_pressed[b] != 0.0f) {
+                slot->pressed |= 1u << b;
+            }
+        }
         for (int a = 0; a < slot->axis_count; a++) {
-            if (slot->axes[a] == in_axes[a]) continue;
             slot->axes[a] = in_axes[a];
-            call_joystick_event("joystickaxis", slot, NULL, a + 1, 1, in_axes[a]);
-            if (g_state.L != L) return;
-            if (slot->mapped && a < GAMEPAD_STICK_AXES) {
-                call_joystick_event("gamepadaxis", slot, gamepad_axis_names[a], 0, 1, in_axes[a]);
-                if (g_state.L != L) return;
+            if (in_axes[a] != 0.0f) {
+                slot->axes_seen |= 1u << a;
             }
         }
 
+        int raw_axes = joystick_axis_count(slot);
+        for (int a = 0; a < raw_axes; a++) {
+            if (old_axes[a] == slot->axes[a]) continue;
+            call_joystick_event("joystickaxis", slot, NULL, a + 1, 1, slot->axes[a]);
+            if (g_state.L != L) return;
+        }
+
         for (int b = 0; b < slot->button_count; b++) {
-            if (slot->values[b] != in_values[b]) {
-                slot->values[b] = in_values[b];
-                int trigger = b - GAMEPAD_TRIGGER_LEFT_BUTTON;
-                if (slot->mapped && (trigger == 0 || trigger == 1)) {
-                    call_joystick_event("gamepadaxis", slot, gamepad_axis_names[GAMEPAD_STICK_AXES + trigger], 0, 1, in_values[b]);
-                    if (g_state.L != L) return;
-                }
-            }
-
-            int pressed = in_pressed[b] != 0.0f;
-            int was_pressed = (slot->pressed >> b) & 1;
-            if (pressed == was_pressed) continue;
-            slot->pressed ^= 1u << b;
-
+            int pressed = (slot->pressed >> b) & 1;
+            if (pressed == (int)((was_pressed >> b) & 1)) continue;
             call_joystick_event(pressed ? "joystickpressed" : "joystickreleased", slot, NULL, b + 1, 0, 0.0f);
             if (g_state.L != L) return;
-            if (slot->mapped && b < GAMEPAD_BUTTON_NAMES && gamepad_button_names[b]) {
-                call_joystick_event(pressed ? "gamepadpressed" : "gamepadreleased", slot, gamepad_button_names[b], 0, 0, 0.0f);
-                if (g_state.L != L) return;
-            }
+        }
+
+        if (!slot->mapping) {
+            continue;
+        }
+
+        for (int a = 0; a < GAMEPAD_AXES; a++) {
+            float value = gamepad_axis_value(slot, a);
+            if (value == slot->gamepad_axes[a]) continue;
+            slot->gamepad_axes[a] = value;
+            call_joystick_event("gamepadaxis", slot, gamepad_axis_names[a], 0, 1, value);
+            if (g_state.L != L) return;
+        }
+
+        for (int b = 0; b < GAMEPAD_BUTTONS; b++) {
+            int pressed = gamepad_button_down(slot, b);
+            if (pressed == (int)((slot->gamepad_pressed >> b) & 1)) continue;
+            slot->gamepad_pressed ^= 1u << b;
+            call_joystick_event(pressed ? "gamepadpressed" : "gamepadreleased", slot, gamepad_button_names[b], 0, 0, 0.0f);
+            if (g_state.L != L) return;
         }
     }
 }
