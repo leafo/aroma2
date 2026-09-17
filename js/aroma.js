@@ -1,6 +1,11 @@
 import wasmAromaModule from './wasm-aroma.js';
 import { createTextureStore } from './texture-store.js';
 import { createAudioStore } from './audio-store.js';
+import { unzip } from './unzip.js';
+
+// Where a project's files live in emscripten's filesystem, PROJECT_ROOT in
+// main.c
+const PROJECT_ROOT = '/game';
 
 /**
  * Initialize the Aroma WebAssembly runtime
@@ -22,6 +27,24 @@ export async function initAroma(canvas, options = {}) {
   };
 
   let textureStore = null;
+  let projectMounted = false;
+
+  // Paths given to newImage and the like. With a project mounted they name
+  // its files and nothing else, without one they are urls
+  async function readAsset(Module, path) {
+    if (projectMounted) {
+      const full = `${PROJECT_ROOT}/${path.replace(/^\/+/, '')}`;
+      if (!Module.FS.analyzePath(full).exists) {
+        throw new Error(`No file ${path} in the project`);
+      }
+      return new Blob([Module.FS.readFile(full)]);
+    }
+    const response = await fetch(path);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch ${path}: ${response.status}`);
+    }
+    return response.blob();
+  }
 
   function ensureTextureStore(Module) {
     if (!textureStore) {
@@ -48,8 +71,8 @@ export async function initAroma(canvas, options = {}) {
     // Completion callbacks must always fire, even on failure: the Lua
     // coroutine that requested the load is suspended until it is resumed.
     Module.requestTextureLoad = (generation, imagePtr, url) => {
-      waitForTextureStore()
-        .then((store) => store.load(url))
+      Promise.all([waitForTextureStore(), readAsset(Module, url)])
+        .then(([store, blob]) => store.load(blob))
         .then(({ id, width, height }) => {
           Module._aroma_image_loaded(generation, imagePtr, id, width, height);
         })
@@ -62,7 +85,8 @@ export async function initAroma(canvas, options = {}) {
     Module.audio = createAudioStore();
 
     Module.requestAudioLoad = (generation, sourcePtr, url) => {
-      Module.audio.load(url)
+      readAsset(Module, url)
+        .then((blob) => Module.audio.load(blob))
         .then(({ id, duration }) => {
           Module._aroma_source_loaded(generation, sourcePtr, id, duration);
         })
@@ -76,12 +100,7 @@ export async function initAroma(canvas, options = {}) {
       try {
         const store = await waitForTextureStore();
 
-        const response = await fetch(url);
-        if (!response.ok) {
-          throw new Error(`Failed to fetch ${url}: ${response.status}`);
-        }
-        const blob = await response.blob();
-        const bitmap = await createImageBitmap(blob);
+        const bitmap = await createImageBitmap(await readAsset(Module, url));
 
         const canvas = document.createElement('canvas');
         canvas.width = bitmap.width;
@@ -422,9 +441,43 @@ export async function initAroma(canvas, options = {}) {
     }
   });
 
+  function removeTree(path) {
+    const FS = Module.FS;
+    if (!FS.analyzePath(path).exists) return;
+    for (const name of FS.readdir(path)) {
+      if (name === '.' || name === '..') continue;
+      const child = `${path}/${name}`;
+      if (FS.isDir(FS.stat(child).mode)) {
+        removeTree(child);
+      } else {
+        FS.unlink(child);
+      }
+    }
+    FS.rmdir(path);
+  }
+
+  // files is a Map of path to Uint8Array
+  function runProject(files) {
+    const FS = Module.FS;
+    removeTree(PROJECT_ROOT);
+    FS.mkdir(PROJECT_ROOT);
+    for (const [path, data] of projectFiles(files)) {
+      const full = `${PROJECT_ROOT}/${path}`;
+      FS.mkdirTree(full.slice(0, full.lastIndexOf('/')));
+      FS.writeFile(full, data);
+    }
+    projectMounted = true;
+    if (Module._run_project() !== 0) {
+      throw new Error('Failed to start the project');
+    }
+  }
+
   return {
     module: Module,
+    runProject,
+    runLove: async (buffer) => runProject(await unzip(buffer)),
     runCode: (code) => {
+      projectMounted = false;
       try {
         const result = Module.ccall(
           'run_lua_code',
@@ -442,6 +495,28 @@ export async function initAroma(canvas, options = {}) {
       }
     }
   };
+}
+
+// A .love zipped from outside the game's folder has everything one level
+// down. love runs those too, so the folder holding main.lua is taken as the
+// root and what lies outside of it is dropped
+function projectFiles(files) {
+  let root = '';
+  if (!files.has('main.lua')) {
+    const mains = [...files.keys()].filter((path) => path.endsWith('/main.lua'));
+    if (mains.length === 0) {
+      throw new Error('No main.lua in the project');
+    }
+    mains.sort((a, b) => a.length - b.length);
+    root = mains[0].slice(0, -'main.lua'.length);
+  }
+
+  const out = new Map();
+  for (const [path, data] of files) {
+    if (!path.startsWith(root) || path.split('/').includes('..')) continue;
+    out.set(path.slice(root.length), data);
+  }
+  return out;
 }
 
 // A canvas is laid out in CSS pixels, which on a display scaled to say 1.25

@@ -56,6 +56,24 @@
       transition: background 0.2s;
     }
 
+    #open-button {
+      padding: 8px 12px;
+      font-size: 13px;
+      background: #2d2d2d;
+      color: #e0e0e0;
+      border: 1px solid #3d3d3d;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+
+    #open-button:hover:not(:disabled) { border-color: #5c6ac4; }
+    #open-button:disabled { color: #888; cursor: not-allowed; }
+
+    #project-status { font-size: 13px; color: #aaa; min-height: 1.2em; }
+    #project-status.error { color: #e57373; }
+
+    body.dragging #canvas-panel { border-color: #5c6ac4; border-style: dashed; }
+
     #run-button:hover:not(:disabled) { background: #4c5ab4; }
     #run-button:active:not(:disabled) { background: #3c4aa4; }
     #run-button:disabled { background: #3d3d3d; color: #888; cursor: not-allowed; }
@@ -94,7 +112,11 @@
       <option value="gamepad.lua">gamepad.lua</option>
       <option value="tetris.moon">tetris.moon</option>
       <option value="bubble.moon">bubble.moon</option>
+      <option value="project.love">project.love</option>
     </select>
+    <button id="open-button" disabled>Open .love (or drop one on the page)</button>
+    <input id="love-input" type="file" accept=".love,.zip" hidden>
+    <div id="project-status"></div>
     <textarea id="code-editor"></textarea>
     <button id="run-button" disabled>Run Code</button>
   </div>

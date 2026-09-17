@@ -28,12 +28,7 @@ export function createTextureStore(gl) {
     return { id, width, height };
   }
 
-  async function load(url, opts) {
-    const response = await fetch(url);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch ${url}: ${response.status}`);
-    }
-    const blob = await response.blob();
+  async function load(blob, opts) {
     const bitmap = await createImageBitmap(blob);
     return createTextureFromSource(bitmap, opts);
   }

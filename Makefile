@@ -17,21 +17,23 @@ LUA_LIB := \
 	loslib.c lstrlib.c ltablib.c loadlib.c linit.c
 SOURCES := main.c $(addprefix $(LUA_DIR)/,$(LUA_CORE) $(LUA_LIB))
 ASSETS := hi.png font1.png blip.wav
-EXAMPLES := $(wildcard examples/*)
+EXAMPLES := $(wildcard examples/*.lua examples/*.moon)
+PROJECT_SRCS := $(shell find examples/project -type f -o -type l)
+PROJECT_LOVE := $(OUT_DIR)/examples/project.love
 
 JS_SRCS := $(shell find js -type f -name '*.js' ! -name 'wasm-aroma.js')
 BUNDLE := $(OUT_DIR)/app.js
 
 CFLAGS := -O3 -DLUA_COMPAT_ALL -s WASM=1 -s FULL_ES2=1 -s MIN_WEBGL_VERSION=1 -s MAX_WEBGL_VERSION=1 \
-          -s ENVIRONMENT=web -s ALLOW_MEMORY_GROWTH=0 -s ASSERTIONS=0 \
+          -s ENVIRONMENT=web -s ALLOW_MEMORY_GROWTH=1 -s FORCE_FILESYSTEM=1 -s ASSERTIONS=0 \
           -s MODULARIZE=1 -s EXPORT_ES6=1 -s EXPORT_NAME=wasmAromaModule \
-          -s EXPORTED_RUNTIME_METHODS=ccall,lengthBytesUTF8,stringToUTF8,HEAP32 \
+          -s EXPORTED_RUNTIME_METHODS=ccall,lengthBytesUTF8,stringToUTF8,HEAP32,FS \
           -I$(LUA_DIR)
 LDFLAGS :=
 
 .PHONY: all clean run
 
-all: $(HTML_OUT) $(BUNDLE)
+all: $(HTML_OUT) $(BUNDLE) $(PROJECT_LOVE)
 
 $(TARGET_JS): main.c | lua-5.2 js
 	EM_CACHE=$(EM_CACHE) $(EMCC) $(SOURCES) $(CFLAGS) $(LDFLAGS) -o $@
@@ -44,7 +46,13 @@ $(HTML_OUT): $(SHELL_FILE) $(BUNDLE) $(TARGET_JS) $(ASSETS) $(EXAMPLES)
 	cp $(WASM_OUT) $(OUT_DIR)/
 	@if [ -f $(DATA_OUT) ]; then cp $(DATA_OUT) $(OUT_DIR)/; fi
 	cp $(ASSETS) $(OUT_DIR)/
-	cp -r examples $(OUT_DIR)/
+	mkdir -p $(OUT_DIR)/examples
+	cp $(EXAMPLES) $(OUT_DIR)/examples/
+
+$(PROJECT_LOVE): $(PROJECT_SRCS) $(ASSETS)
+	mkdir -p $(OUT_DIR)/examples
+	rm -f $@
+	cd examples/project && zip -q -r $(abspath $@) .
 
 js:
 	mkdir -p js

@@ -12,6 +12,10 @@ due to removed APIs: https://github.com/leafo/aroma
 
 Aroma provides a `aroma.*` API and includes a `love.*` alias for compatibility with Love2D-style code.
 
+The shell also runs `.love` files: drop one on the page or use the open
+button. From your own page it's `aroma.runLove(arrayBuffer)`, or
+`aroma.runProject(files)` with a `Map` of path to `Uint8Array`.
+
 ## Prerequisites
 
 - [Emscripten SDK](https://emscripten.org) with `emcc` 
@@ -45,6 +49,7 @@ Before the first deployment, open the repository's **Settings → Pages** and se
 - `js/aroma.js` — programmatic API for initializing and interacting with the Aroma runtime.
 - `js/shell.js` — shell UI code (code editor, run button, example selector).
 - `js/texture-store.js` — WebGL texture management helper.
+- `js/unzip.js` — zip reader for `.love` files.
 - `examples/` — Lua example files that can be loaded in the shell.
 - `Makefile` — orchestrates both the wasm build and the JS bundle.
 - `shell.html` — HTML wrapper with code editor and canvas, copied to `dist/index.html`.

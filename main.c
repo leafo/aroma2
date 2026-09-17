@@ -4,11 +4,13 @@
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
+#include <dirent.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #define STACK_MAX 32
 #define MAX_GLYPHS 256
@@ -17,6 +19,8 @@
 /* requestAnimationFrame stops in a hidden tab, so the first frame back would
  * otherwise carry the whole absence as one step */
 #define MAX_DT 0.1f
+#define PROJECT_ROOT "/game"
+#define PROJECT_PATH_MAX 1024
 
 typedef struct {
     float m[9];
@@ -3026,15 +3030,200 @@ static int l_joystick_setGamepadMapping(lua_State *L) {
     return 1;
 }
 
-/* loadGamepadMappings(text) in SDL's gamecontrollerdb format. Mappings for
- * other platforms are skipped, the raw numbering differs between them */
+/* love.filesystem paths are relative to the project, which js unpacks into
+ * emscripten's in-memory filesystem under PROJECT_ROOT. Returns 0 for a path
+ * that would leave it */
+static int project_path(const char *path, char *out, size_t out_size) {
+    while (*path == '/') {
+        path++;
+    }
+    for (const char *segment = path; *segment;) {
+        const char *slash = strchr(segment, '/');
+        size_t length = slash ? (size_t)(slash - segment) : strlen(segment);
+        if (length == 2 && segment[0] == '.' && segment[1] == '.') {
+            return 0;
+        }
+        segment += length;
+        if (*segment) {
+            segment++;
+        }
+    }
+    return snprintf(out, out_size, PROJECT_ROOT "/%s", path) < (int)out_size;
+}
+
+static int stat_project_path(const char *path, struct stat *info) {
+    char full[PROJECT_PATH_MAX];
+    return project_path(path, full, sizeof(full)) && stat(full, info) == 0;
+}
+
+/* Pushes the contents of a project file. Returns 0 with nothing pushed when
+ * there is no such file */
+static int push_project_file(lua_State *L, const char *path) {
+    char full[PROJECT_PATH_MAX];
+    struct stat info;
+    if (!project_path(path, full, sizeof(full)) || stat(full, &info) != 0 || !S_ISREG(info.st_mode)) {
+        return 0;
+    }
+    FILE *file = fopen(full, "rb");
+    if (!file) {
+        return 0;
+    }
+
+    luaL_Buffer buffer;
+    luaL_buffinit(L, &buffer);
+    size_t count;
+    do {
+        char *chunk = luaL_prepbuffer(&buffer);
+        count = fread(chunk, 1, LUAL_BUFFERSIZE, file);
+        luaL_addsize(&buffer, count);
+    } while (count == LUAL_BUFFERSIZE);
+    fclose(file);
+    luaL_pushresult(&buffer);
+    return 1;
+}
+
+/* getInfo(path [, filtertype]) or getInfo(path [, filtertype], info) */
+static int l_filesystem_getInfo(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+    const char *filter = lua_type(L, 2) == LUA_TSTRING ? lua_tostring(L, 2) : NULL;
+    int table_index = lua_istable(L, 2) ? 2 : (lua_istable(L, 3) ? 3 : 0);
+
+    struct stat info;
+    if (!stat_project_path(path, &info)) {
+        return 0;
+    }
+    const char *type = S_ISDIR(info.st_mode) ? "directory" : (S_ISREG(info.st_mode) ? "file" : "other");
+    if (filter && strcmp(filter, type) != 0) {
+        return 0;
+    }
+
+    if (table_index) {
+        lua_pushvalue(L, table_index);
+    } else {
+        lua_newtable(L);
+    }
+    lua_pushstring(L, type);
+    lua_setfield(L, -2, "type");
+    if (S_ISREG(info.st_mode)) {
+        lua_pushnumber(L, (lua_Number)info.st_size);
+        lua_setfield(L, -2, "size");
+    }
+    lua_pushnumber(L, (lua_Number)info.st_mtime);
+    lua_setfield(L, -2, "modtime");
+    return 1;
+}
+
+static int l_filesystem_read(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+    if (!push_project_file(L, path)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "Could not open file %s. Does not exist.", path);
+        return 2;
+    }
+    size_t length;
+    const char *contents = lua_tolstring(L, -1, &length);
+    if (lua_isnumber(L, 2) && (size_t)lua_tonumber(L, 2) < length) {
+        length = (size_t)lua_tonumber(L, 2);
+        lua_pushlstring(L, contents, length);
+    }
+    lua_pushnumber(L, (lua_Number)length);
+    return 2;
+}
+
+static int filesystem_next_line(lua_State *L) {
+    size_t length;
+    const char *contents = lua_tolstring(L, lua_upvalueindex(1), &length);
+    size_t start = (size_t)lua_tonumber(L, lua_upvalueindex(2));
+    if (start >= length) {
+        return 0;
+    }
+
+    const char *newline = memchr(contents + start, '\n', length - start);
+    size_t end = newline ? (size_t)(newline - contents) : length;
+    size_t line_length = end - start;
+    if (line_length > 0 && contents[end - 1] == '\r') {
+        line_length--;
+    }
+
+    lua_pushnumber(L, (lua_Number)(end + 1));
+    lua_replace(L, lua_upvalueindex(2));
+    lua_pushlstring(L, contents + start, line_length);
+    return 1;
+}
+
+static int l_filesystem_lines(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+    if (!push_project_file(L, path)) {
+        return luaL_error(L, "Could not open file %s. Does not exist.", path);
+    }
+    lua_pushnumber(L, 0);
+    lua_pushcclosure(L, filesystem_next_line, 2);
+    return 1;
+}
+
+static int l_filesystem_load(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+    if (!push_project_file(L, path)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "Could not open file %s. Does not exist.", path);
+        return 2;
+    }
+    size_t length;
+    const char *contents = lua_tolstring(L, -1, &length);
+    lua_pushfstring(L, "@%s", path);
+    if (luaL_loadbuffer(L, contents, length, lua_tostring(L, -1)) != LUA_OK) {
+        lua_pushnil(L);
+        lua_insert(L, -2);
+        return 2;
+    }
+    return 1;
+}
+
+static int l_filesystem_getDirectoryItems(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+    lua_newtable(L);
+
+    char full[PROJECT_PATH_MAX];
+    DIR *dir = project_path(path, full, sizeof(full)) ? opendir(full) : NULL;
+    if (!dir) {
+        return 1;
+    }
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        lua_pushstring(L, entry->d_name);
+        lua_rawseti(L, -2, ++count);
+    }
+    closedir(dir);
+
+    /* love lists them sorted */
+    lua_getglobal(L, "table");
+    lua_getfield(L, -1, "sort");
+    lua_pushvalue(L, -3);
+    lua_call(L, 1, 0);
+    lua_pop(L, 1);
+    return 1;
+}
+
+static void load_gamepad_mappings(const char *text, size_t length);
+
+/* loadGamepadMappings(text or filename) in SDL's gamecontrollerdb format */
 static int l_joystick_loadGamepadMappings(lua_State *L) {
     size_t length;
     const char *text = luaL_checklstring(L, 1, &length);
-    if (!memchr(text, ',', length)) {
-        return luaL_error(L, "love.joystick.loadGamepadMappings: loading from a file isn't supported yet, pass the mappings as a string");
+    if (push_project_file(L, text)) {
+        text = lua_tolstring(L, -1, &length);
     }
+    load_gamepad_mappings(text, length);
+    return 0;
+}
 
+/* Mappings for other platforms are skipped, the raw numbering differs between
+ * them */
+static void load_gamepad_mappings(const char *text, size_t length) {
     const char *end = text + length;
     while (text < end) {
         const char *newline = memchr(text, '\n', (size_t)(end - text));
@@ -3055,7 +3244,6 @@ static int l_joystick_loadGamepadMappings(lua_State *L) {
     }
 
     reassign_mappings();
-    return 0;
 }
 
 static int l_keyboard_setKeyRepeat(lua_State *L) {
@@ -4107,6 +4295,19 @@ static void register_aroma_api(lua_State *L) {
     lua_setfield(L, -2, "loadGamepadMappings");
     lua_setfield(L, -2, "joystick"); /* aroma.joystick = table */
 
+    lua_newtable(L);                /* aroma.filesystem */
+    lua_pushcfunction(L, l_filesystem_getInfo);
+    lua_setfield(L, -2, "getInfo");
+    lua_pushcfunction(L, l_filesystem_read);
+    lua_setfield(L, -2, "read");
+    lua_pushcfunction(L, l_filesystem_lines);
+    lua_setfield(L, -2, "lines");
+    lua_pushcfunction(L, l_filesystem_load);
+    lua_setfield(L, -2, "load");
+    lua_pushcfunction(L, l_filesystem_getDirectoryItems);
+    lua_setfield(L, -2, "getDirectoryItems");
+    lua_setfield(L, -2, "filesystem"); /* aroma.filesystem = table */
+
     lua_newtable(L);                /* aroma.audio */
     lua_pushcfunction(L, l_audio_newSource);
     lua_setfield(L, -2, "newSource");
@@ -4602,6 +4803,72 @@ static const char *bootstrap_source =
     "chunk()\n"
     "if type(aroma.load) == 'function' then aroma.load() end\n";
 
+/* Boots a project the way love's boot.lua does: conf.lua, the window it asks
+ * for, main.lua, love.load.
+ *
+ * require is replaced by one written in Lua. A module that loads an image at
+ * its top level has to yield to wait for it, and a yield can't cross the C
+ * require. Modules come from love.filesystem so errors name them by their
+ * path in the project */
+static const char *project_bootstrap_source =
+    "local fs = love.filesystem\n"
+    "local loaded, searchers = package.loaded, package.searchers\n"
+    "searchers[2] = function(name)\n"
+    "  local base = name:gsub('%.', '/')\n"
+    "  local tried = {}\n"
+    "  for _, template in ipairs({'?.lua', '?/init.lua'}) do\n"
+    "    local path = template:gsub('%?', base)\n"
+    "    if fs.getInfo(path, 'file') then\n"
+    "      local chunk, err = fs.load(path)\n"
+    "      if not chunk then error(err, 0) end\n"
+    "      return chunk, path\n"
+    "    end\n"
+    "    tried[#tried + 1] = \"\\n\\tno file '\" .. path .. \"'\"\n"
+    "  end\n"
+    "  return table.concat(tried)\n"
+    "end\n"
+    "searchers[3], searchers[4] = nil, nil\n"
+    "function require(name)\n"
+    "  if loaded[name] ~= nil then return loaded[name] end\n"
+    "  local tried = {}\n"
+    "  for _, searcher in ipairs(searchers) do\n"
+    "    local loader, extra = searcher(name)\n"
+    "    if type(loader) == 'function' then\n"
+    "      local result = loader(name, extra)\n"
+    "      if result ~= nil then loaded[name] = result end\n"
+    "      if loaded[name] == nil then loaded[name] = true end\n"
+    "      return loaded[name]\n"
+    "    elseif type(loader) == 'string' then\n"
+    "      tried[#tried + 1] = loader\n"
+    "    end\n"
+    "  end\n"
+    "  error(\"module '\" .. name .. \"' not found:\" .. table.concat(tried), 2)\n"
+    "end\n"
+    "local conf = {\n"
+    "  version = '11.5', console = false, gammacorrect = false,\n"
+    "  audio = { mixwithsystem = true },\n"
+    "  window = {\n"
+    "    title = 'Untitled', width = 800, height = 600, borderless = false,\n"
+    "    resizable = false, minwidth = 1, minheight = 1, fullscreen = false,\n"
+    "    fullscreentype = 'desktop', vsync = 1, msaa = 0, display = 1,\n"
+    "    highdpi = false, usedpiscale = true,\n"
+    "  },\n"
+    "  modules = {},\n"
+    "}\n"
+    "for _, name in ipairs({'audio', 'data', 'event', 'font', 'graphics', 'image',\n"
+    "    'joystick', 'keyboard', 'math', 'mouse', 'physics', 'sound', 'system',\n"
+    "    'thread', 'timer', 'touch', 'video', 'window'}) do\n"
+    "  conf.modules[name] = true\n"
+    "end\n"
+    "if fs.getInfo('conf.lua', 'file') then require('conf') end\n"
+    "if type(love.conf) == 'function' then love.conf(conf) end\n"
+    "if type(conf.window) == 'table' then\n"
+    "  love.window.setMode(conf.window.width or 800, conf.window.height or 600, conf.window)\n"
+    "  love.window.setTitle(conf.window.title or conf.title or 'Untitled')\n"
+    "end\n"
+    "require('main')\n"
+    "if type(love.load) == 'function' then love.load({}, {}) end\n";
+
 static void close_lua_state(void) {
     /* Invalidate completions of any loads still in flight on the old state */
     g_state.generation++;
@@ -4672,7 +4939,8 @@ static int finish_quit(void) {
     return 1;
 }
 
-EMSCRIPTEN_KEEPALIVE int run_lua_code(const char *code) {
+/* code is handed to the bootstrap as its argument when there is any */
+static int start_run(const char *bootstrap, const char *code) {
     close_lua_state();
 
     /* A run starts from the same window and colors whatever the last one did */
@@ -4691,16 +4959,30 @@ EMSCRIPTEN_KEEPALIVE int run_lua_code(const char *code) {
     random_set_seed(&g_random, (uint64_t)emscripten_get_now() ^ ((uint64_t)(emscripten_random() * 4294967296.0) << 32));
 
     lua_State *T = script_thread_begin(SCRIPT_ENTRY_BOOTSTRAP);
-    if (luaL_loadstring(T, bootstrap_source) != LUA_OK ||
-        luaL_loadstring(T, code) != LUA_OK) {
+    if (luaL_loadstring(T, bootstrap) != LUA_OK ||
+        (code && luaL_loadstring(T, code) != LUA_OK)) {
         report_lua_error(T);
         script_thread_finish();
         return 1;
     }
 
     /* May suspend on resource loads; runs to completion asynchronously */
-    int status = script_thread_run(1);
+    int status = script_thread_run(code ? 1 : 0);
     return status == LUA_OK || status == LUA_YIELD ? 0 : 1;
+}
+
+EMSCRIPTEN_KEEPALIVE int run_lua_code(const char *code) {
+    return start_run(bootstrap_source, code);
+}
+
+/* Runs the project js has unpacked under PROJECT_ROOT */
+EMSCRIPTEN_KEEPALIVE int run_project(void) {
+    struct stat info;
+    if (!stat_project_path("main.lua", &info)) {
+        fprintf(stderr, "No main.lua in the project\n");
+        return 1;
+    }
+    return start_run(project_bootstrap_source, NULL);
 }
 
 EMSCRIPTEN_KEEPALIVE void aroma_focus(int focused) {

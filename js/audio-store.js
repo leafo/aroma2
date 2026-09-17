@@ -47,13 +47,9 @@ export function createAudioStore() {
     return id;
   }
 
-  async function load(url) {
+  async function load(blob) {
     const ctx = ensureContext();
-    const response = await fetch(url);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch ${url}: ${response.status}`);
-    }
-    const buffer = await ctx.decodeAudioData(await response.arrayBuffer());
+    const buffer = await ctx.decodeAudioData(await blob.arrayBuffer());
     return { id: add(buffer), duration: buffer.duration };
   }
 

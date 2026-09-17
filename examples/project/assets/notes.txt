@@ -1,0 +1,2 @@
+main.lua requires assets.lua and entities/bouncer.lua
+these lines come from assets/notes.txt

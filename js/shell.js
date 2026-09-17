@@ -6,6 +6,9 @@ const canvas = document.getElementById('canvas');
 const codeEditor = document.getElementById('code-editor');
 const runButton = document.getElementById('run-button');
 const exampleSelector = document.getElementById('example-selector');
+const openButton = document.getElementById('open-button');
+const loveInput = document.getElementById('love-input');
+const projectStatus = document.getElementById('project-status');
 
 if (!canvas) {
   throw new Error('missing #canvas element');
@@ -17,6 +20,10 @@ let currentLanguage = 'lua';
 
 // Load example code from file
 async function loadExample(filename) {
+  if (filename.endsWith('.love')) {
+    codeEditor.value = '-- examples/project, packed into a .love and run as a whole\n';
+    return;
+  }
   currentLanguage = filename.endsWith('.moon') ? 'moon' : 'lua';
   try {
     // Examples change under a static server that sends no cache headers, so
@@ -63,7 +70,55 @@ initAroma(canvas).then((aroma) => {
     }
   };
 
-  runButton.addEventListener('click', runCode);
+  runButton.addEventListener('click', () => {
+    projectStatus.textContent = '';
+    runCode();
+  });
+
+  const runLove = async (file) => {
+    projectStatus.className = '';
+    projectStatus.textContent = `loading ${file.name}`;
+    try {
+      await aroma.runLove(await file.arrayBuffer());
+      projectStatus.textContent = `running ${file.name}`;
+      canvas.focus();
+    } catch (err) {
+      console.error('Failed to run', file.name, err);
+      projectStatus.className = 'error';
+      projectStatus.textContent = `${file.name}: ${err.message}`;
+    }
+  };
+
+  exampleSelector.addEventListener('change', async () => {
+    const name = exampleSelector.value;
+    if (!name.endsWith('.love')) return;
+    const response = await fetch(`examples/${name}`, { cache: 'no-cache' });
+    runLove(new File([await response.blob()], name));
+  });
+
+  openButton.addEventListener('click', () => loveInput.click());
+  loveInput.addEventListener('change', () => {
+    if (loveInput.files[0]) runLove(loveInput.files[0]);
+    // so picking the same file again still fires a change
+    loveInput.value = '';
+  });
+
+  // dragover has to be cancelled for the drop to be delivered at all
+  window.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    document.body.classList.add('dragging');
+  });
+  window.addEventListener('dragleave', (e) => {
+    if (!e.relatedTarget) document.body.classList.remove('dragging');
+  });
+  window.addEventListener('drop', (e) => {
+    e.preventDefault();
+    document.body.classList.remove('dragging');
+    const file = e.dataTransfer.files[0];
+    if (file) runLove(file);
+  });
+
+  openButton.disabled = false;
 
   codeEditor.addEventListener('keydown', (e) => {
     if (e.ctrlKey && e.key === 'Enter') {
