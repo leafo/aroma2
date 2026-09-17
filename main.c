@@ -12,6 +12,11 @@
 
 #define STACK_MAX 32
 #define MAX_GLYPHS 256
+#define DEFAULT_WIDTH 800
+#define DEFAULT_HEIGHT 600
+/* requestAnimationFrame stops in a hidden tab, so the first frame back would
+ * otherwise carry the whole absence as one step */
+#define MAX_DT 0.1f
 
 typedef struct {
     float m[9];
@@ -47,7 +52,8 @@ typedef enum {
     SCRIPT_ENTRY_UPDATE,
     SCRIPT_ENTRY_DRAW,
     SCRIPT_ENTRY_KEY_EVENT,
-    SCRIPT_ENTRY_FOCUS
+    SCRIPT_ENTRY_FOCUS,
+    SCRIPT_ENTRY_QUIT
 } ScriptEntryPoint;
 
 typedef struct {
@@ -95,6 +101,10 @@ typedef struct {
     /* Set by resource constructors just before they yield. A yield without it
      * came from user code and has no completion to resume it. */
     int resource_wait;
+    /* Off by default like love: held keys send one keypressed */
+    int key_repeat;
+    /* Set from inside Lua, the state is torn down once the frame unwinds */
+    int quit_requested;
 } EngineState;
 
 static EngineState g_state;
@@ -210,6 +220,29 @@ EM_JS(void, js_request_font_load, (int generation, uintptr_t font_ptr, const cha
   } else {
     console.error('Module.requestFontLoad is not defined');
     setTimeout(() => Module._aroma_font_set_glyphs(generation, font_ptr, 0, 0, 0, 0), 0);
+  }
+});
+
+EM_JS(int, js_desktop_width, (void), {
+  return Module.getDesktopDimensions ? Module.getDesktopDimensions()[0] : window.screen.width;
+});
+
+EM_JS(int, js_desktop_height, (void), {
+  return Module.getDesktopDimensions ? Module.getDesktopDimensions()[1] : window.screen.height;
+});
+
+EM_JS(void, js_set_title, (const char *title), {
+  const text = UTF8ToString(title);
+  if (Module.setTitle) {
+    Module.setTitle(text);
+  } else {
+    document.title = text;
+  }
+});
+
+EM_JS(void, js_on_quit, (void), {
+  if (Module.onQuit) {
+    Module.onQuit();
   }
 });
 
@@ -896,6 +929,88 @@ static int l_keyboard_isDown(lua_State *L) {
 }
 
 
+static int l_keyboard_setKeyRepeat(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TBOOLEAN);
+    g_state.key_repeat = lua_toboolean(L, 1);
+    return 0;
+}
+
+static int l_keyboard_hasKeyRepeat(lua_State *L) {
+    lua_pushboolean(L, g_state.key_repeat);
+    return 1;
+}
+
+static void setup_projection(float width, float height);
+
+static void set_canvas_size(int width, int height) {
+    g_state.canvas_width = width;
+    g_state.canvas_height = height;
+    emscripten_set_canvas_element_size("#canvas", width, height);
+    glViewport(0, 0, width, height);
+    setup_projection((float)width, (float)height);
+}
+
+/* The flags table is accepted and ignored. Fullscreen is asked for with a
+ * size of 0, which takes the size of the desktop like it does in love */
+static int l_window_setMode(lua_State *L) {
+    int width = (int)luaL_checkinteger(L, 1);
+    int height = (int)luaL_checkinteger(L, 2);
+    luaL_argcheck(L, width >= 0, 1, "width must not be negative");
+    luaL_argcheck(L, height >= 0, 2, "height must not be negative");
+
+    if (width == 0) width = js_desktop_width();
+    if (height == 0) height = js_desktop_height();
+
+    set_canvas_size(width, height);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_window_getMode(lua_State *L) {
+    lua_pushinteger(L, g_state.canvas_width);
+    lua_pushinteger(L, g_state.canvas_height);
+    lua_newtable(L);
+    return 3;
+}
+
+static int l_window_getDesktopDimensions(lua_State *L) {
+    lua_pushinteger(L, js_desktop_width());
+    lua_pushinteger(L, js_desktop_height());
+    return 2;
+}
+
+/* Kept in the registry so getTitle works without a trip through the page */
+static int l_window_setTitle(lua_State *L) {
+    js_set_title(luaL_checkstring(L, 1));
+    lua_settop(L, 1);
+    lua_setfield(L, LUA_REGISTRYINDEX, "aroma.window_title");
+    return 0;
+}
+
+static int l_window_getTitle(lua_State *L) {
+    lua_getfield(L, LUA_REGISTRYINDEX, "aroma.window_title");
+    if (lua_isnil(L, -1)) {
+        lua_pushliteral(L, "");
+    }
+    return 1;
+}
+
+static int l_event_quit(lua_State *L) {
+    (void)L;
+    g_state.quit_requested = 1;
+    return 0;
+}
+
+/* There is no event queue, quit is the one event scripts push by hand */
+static int l_event_push(lua_State *L) {
+    const char *name = luaL_checkstring(L, 1);
+    if (strcmp(name, "quit") != 0) {
+        return luaL_error(L, "love.event.push: only 'quit' is supported, got '%s'", name);
+    }
+    g_state.quit_requested = 1;
+    return 0;
+}
+
 static int l_timer_getTime(lua_State *L) {
     lua_pushnumber(L, (emscripten_get_now() - g_state.start_time) * 0.001);
     return 1;
@@ -1285,7 +1400,31 @@ static void register_aroma_api(lua_State *L) {
     lua_newtable(L);                /* aroma.keyboard */
     lua_pushcfunction(L, l_keyboard_isDown);
     lua_setfield(L, -2, "isDown");
+    lua_pushcfunction(L, l_keyboard_setKeyRepeat);
+    lua_setfield(L, -2, "setKeyRepeat");
+    lua_pushcfunction(L, l_keyboard_hasKeyRepeat);
+    lua_setfield(L, -2, "hasKeyRepeat");
     lua_setfield(L, -2, "keyboard"); /* aroma.keyboard = table */
+
+    lua_newtable(L);                /* aroma.window */
+    lua_pushcfunction(L, l_window_setMode);
+    lua_setfield(L, -2, "setMode");
+    lua_pushcfunction(L, l_window_getMode);
+    lua_setfield(L, -2, "getMode");
+    lua_pushcfunction(L, l_window_getDesktopDimensions);
+    lua_setfield(L, -2, "getDesktopDimensions");
+    lua_pushcfunction(L, l_window_setTitle);
+    lua_setfield(L, -2, "setTitle");
+    lua_pushcfunction(L, l_window_getTitle);
+    lua_setfield(L, -2, "getTitle");
+    lua_setfield(L, -2, "window");   /* aroma.window = table */
+
+    lua_newtable(L);                /* aroma.event */
+    lua_pushcfunction(L, l_event_quit);
+    lua_setfield(L, -2, "quit");
+    lua_pushcfunction(L, l_event_push);
+    lua_setfield(L, -2, "push");
+    lua_setfield(L, -2, "event");    /* aroma.event = table */
 
     lua_newtable(L);                /* aroma.timer */
     lua_pushcfunction(L, l_timer_getTime);
@@ -1432,7 +1571,11 @@ static void call_aroma_draw(void) {
     script_thread_run(0);
 }
 
-static void call_aroma_key_event(const char *name, const char *key) {
+static int finish_quit(void);
+
+/* Scancodes aren't tracked apart from keys, the key stands in for both.
+ * is_repeat is negative for keyreleased, which doesn't take one */
+static void call_aroma_key_event(const char *name, const char *key, int is_repeat) {
     lua_State *T = script_thread_begin(SCRIPT_ENTRY_KEY_EVENT);
     if (!T) return;
     if (!push_aroma_callback(T, name)) {
@@ -1440,7 +1583,14 @@ static void call_aroma_key_event(const char *name, const char *key) {
         return;
     }
     lua_pushstring(T, key);
-    script_thread_run(1);
+    lua_pushstring(T, key);
+    int nargs = 2;
+    if (is_repeat >= 0) {
+        lua_pushboolean(T, is_repeat);
+        nargs++;
+    }
+    script_thread_run(nargs);
+    finish_quit();
 }
 
 EMSCRIPTEN_KEEPALIVE void aroma_image_loaded(int generation, uintptr_t image_ptr, int texture_id, int width, int height) {
@@ -1596,11 +1746,7 @@ static int init_webgl(void) {
         return 0;
     }
 
-    g_state.canvas_width = 800;
-    g_state.canvas_height = 600;
-    emscripten_set_canvas_element_size("#canvas", g_state.canvas_width, g_state.canvas_height);
-    glViewport(0, 0, g_state.canvas_width, g_state.canvas_height);
-    setup_projection((float)g_state.canvas_width, (float)g_state.canvas_height);
+    set_canvas_size(DEFAULT_WIDTH, DEFAULT_HEIGHT);
 
     // Enable alpha blending for transparent images
     glEnable(GL_BLEND);
@@ -1618,6 +1764,9 @@ static void main_loop(void *userdata) {
     (void)userdata;
     double now = emscripten_get_now();
     float dt = (float)((now - g_state.last_time) * 0.001);
+    if (dt > MAX_DT) {
+        dt = MAX_DT;
+    }
     g_state.last_time = now;
     g_state.dt = dt;
 
@@ -1636,7 +1785,7 @@ static void main_loop(void *userdata) {
 
     call_aroma_update(dt);
 
-    if (g_state.script_thread) {
+    if (finish_quit() || g_state.script_thread) {
         return;
     }
 
@@ -1645,6 +1794,7 @@ static void main_loop(void *userdata) {
 
     reset_graphics_state();
     call_aroma_draw();
+    finish_quit();
 }
 
 static const char *bootstrap_source =
@@ -1652,23 +1802,79 @@ static const char *bootstrap_source =
     "chunk()\n"
     "if type(aroma.load) == 'function' then aroma.load() end\n";
 
-EMSCRIPTEN_KEEPALIVE int run_lua_code(const char *code) {
+static void close_lua_state(void) {
     /* Invalidate completions of any loads still in flight on the old state */
     g_state.generation++;
 
-    if (g_state.L) {
-        lua_close(g_state.L);
-        g_state.L = NULL;
-        g_state.script_thread = NULL;
-        g_state.script_thread_ref = LUA_NOREF;
-        g_state.idle_thread = NULL;
-        g_state.idle_thread_ref = LUA_NOREF;
-        g_state.script_entry_point = SCRIPT_ENTRY_NONE;
-        g_state.discard_rendering = 0;
-        g_state.resource_wait = 0;
-        g_state.current_font = NULL;
-        g_state.current_font_ref = LUA_NOREF;
+    if (!g_state.L) {
+        return;
     }
+
+    lua_close(g_state.L);
+    g_state.L = NULL;
+    g_state.script_thread = NULL;
+    g_state.script_thread_ref = LUA_NOREF;
+    g_state.idle_thread = NULL;
+    g_state.idle_thread_ref = LUA_NOREF;
+    g_state.script_entry_point = SCRIPT_ENTRY_NONE;
+    g_state.discard_rendering = 0;
+    g_state.resource_wait = 0;
+    g_state.current_font = NULL;
+    g_state.current_font_ref = LUA_NOREF;
+    g_state.key_repeat = 0;
+    g_state.quit_requested = 0;
+}
+
+/* Runs love.quit and returns whether it asked to keep going */
+static int quit_aborted(void) {
+    lua_State *T = script_thread_begin(SCRIPT_ENTRY_QUIT);
+    if (!T) return 0;
+    if (!push_aroma_callback(T, "quit")) {
+        script_thread_finish();
+        return 0;
+    }
+
+    int aborted = 0;
+    int status = lua_resume(T, NULL, 0);
+    if (status == LUA_OK) {
+        aborted = lua_gettop(T) > 0 && lua_toboolean(T, 1);
+    } else if (status == LUA_YIELD) {
+        fprintf(stderr, "Lua error: love.quit cannot wait on a resource load\n");
+    } else {
+        report_lua_error(T);
+    }
+    script_thread_finish();
+    return aborted;
+}
+
+/* Acts on a quit asked for during the entry point that just ran. A quit from
+ * an entry point that is still suspended on a load waits for it to finish.
+ * Returns whether the state was closed */
+static int finish_quit(void) {
+    if (!g_state.quit_requested || !g_state.L || g_state.script_thread) {
+        return 0;
+    }
+    g_state.quit_requested = 0;
+
+    if (quit_aborted()) {
+        return 0;
+    }
+
+    close_lua_state();
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    js_on_quit();
+    return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE int run_lua_code(const char *code) {
+    close_lua_state();
+
+    /* A run starts from the same window and colors whatever the last one did */
+    set_canvas_size(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+    g_state.bg_color[0] = g_state.bg_color[1] = g_state.bg_color[2] = 0.0f;
+    g_state.bg_color[3] = 1.0f;
+    g_state.draw_color[0] = g_state.draw_color[1] = g_state.draw_color[2] = g_state.draw_color[3] = 1.0f;
 
     g_state.L = luaL_newstate();
     if (!g_state.L) {
@@ -1706,12 +1912,15 @@ EMSCRIPTEN_KEEPALIVE void aroma_focus(int focused) {
     script_thread_run(1);
 }
 
-EMSCRIPTEN_KEEPALIVE void aroma_keypressed(const char *key) {
-    call_aroma_key_event("keypressed", key);
+EMSCRIPTEN_KEEPALIVE void aroma_keypressed(const char *key, int is_repeat) {
+    if (is_repeat && !g_state.key_repeat) {
+        return;
+    }
+    call_aroma_key_event("keypressed", key, is_repeat);
 }
 
 EMSCRIPTEN_KEEPALIVE void aroma_keyreleased(const char *key) {
-    call_aroma_key_event("keyreleased", key);
+    call_aroma_key_event("keyreleased", key, -1);
 }
 
 int main(void) {

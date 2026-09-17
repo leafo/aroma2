@@ -299,7 +299,7 @@ class Game
     @score = 0
 
     @keys = {name, key_repeater(name) for name in *{
-      "left", "right", "up", "down", " "
+      "left", "right", "up", "down", "space"
     }}
 
   -- called from key repeaters
@@ -314,7 +314,7 @@ class Game
           @push_down!
         when "up"
           @current_piece\try_rotate!
-        when " "
+        when "space"
           while @push_down! do nil
           nil
 

@@ -219,8 +219,7 @@ export async function initAroma(canvas) {
       // Common keys
       'Enter': 'return',
       'Escape': 'escape',
-      // spacebar falls through to ' ': pre-0.10 love (the compat target) used
-      // " " as the key constant, not "space"
+      ' ': 'space',
       'Tab': 'tab',
       'Backspace': 'backspace',
       'Delete': 'delete',
@@ -293,15 +292,27 @@ export async function initAroma(canvas) {
 
   // Set up keyboard event handling
   canvas.setAttribute('tabindex', '0'); // Make canvas focusable
+  // Keys the page would otherwise act on while the game has focus: scrolling
+  // and moving focus off the canvas. Browser shortcuts are left alone
+  const pageKeys = new Set([' ', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Tab', 'Backspace', 'PageUp', 'PageDown', 'Home', 'End']);
+
+  function claimKey(e) {
+    if (pageKeys.has(e.key) && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+    }
+  }
+
   canvas.addEventListener('keydown', (e) => {
+    claimKey(e);
     const key = mapKeyName(e.key, e.location);
     pressedKeys.add(key);
     if (Module._aroma_keypressed) {
-      Module.ccall('aroma_keypressed', null, ['string'], [key]);
+      Module.ccall('aroma_keypressed', null, ['string', 'number'], [key, e.repeat ? 1 : 0]);
     }
   });
 
   canvas.addEventListener('keyup', (e) => {
+    claimKey(e);
     const key = mapKeyName(e.key, e.location);
     pressedKeys.delete(key);
     if (Module._aroma_keyreleased) {

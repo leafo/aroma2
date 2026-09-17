@@ -259,7 +259,7 @@ class Game
       when "title"
         @state = "play"
       when "play"
-        @shoot! if key == " " or key == "up"
+        @shoot! if key == "space" or key == "up"
       when "over", "win"
         if key == "return"
           game = Game!
