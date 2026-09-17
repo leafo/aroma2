@@ -283,6 +283,9 @@ typedef struct {
     int key_repeat;
     /* Set from inside Lua, the state is torn down once the frame unwinds */
     int quit_requested;
+    /* Set by the first Lua error. No entry point runs again until the next
+     * run, where love would be showing its error screen */
+    int errored;
 } EngineState;
 
 static EngineState g_state;
@@ -572,6 +575,12 @@ EM_JS(void, js_canvas_resized, (void), {
 
 EM_JS(void, js_set_cursor_visible, (int visible), {
   Module.canvas.style.cursor = visible ? "" : "none";
+});
+
+EM_JS(void, js_on_error, (const char *message), {
+  if (Module.onError) {
+    Module.onError(UTF8ToString(message));
+  }
 });
 
 EM_JS(void, js_on_quit, (void), {
@@ -3458,6 +3467,15 @@ static int l_graphics_getBlendMode(lua_State *L) {
     return 2;
 }
 
+static int l_graphics_getCanvasFormats(lua_State *L) {
+    lua_newtable(L);
+    lua_pushboolean(L, 1);
+    lua_setfield(L, -2, "normal");
+    lua_pushboolean(L, 1);
+    lua_setfield(L, -2, "rgba8");
+    return 1;
+}
+
 /* Starts out transparent black */
 static int l_graphics_newCanvas(lua_State *L) {
     int width = (int)luaL_optinteger(L, 1, g_state.window_width);
@@ -4215,6 +4233,8 @@ static void register_aroma_api(lua_State *L) {
 
     lua_pushcfunction(L, l_graphics_newCanvas);
     lua_setfield(L, -2, "newCanvas");
+    lua_pushcfunction(L, l_graphics_getCanvasFormats);
+    lua_setfield(L, -2, "getCanvasFormats");
 
     lua_pushcfunction(L, l_graphics_setCanvas);
     lua_setfield(L, -2, "setCanvas");
@@ -4394,6 +4414,8 @@ static void register_aroma_api(lua_State *L) {
 static void report_lua_error(lua_State *L) {
     const char *msg = lua_tostring(L, -1);
     fprintf(stderr, "Lua error: %s\n", msg ? msg : "(unknown)");
+    g_state.errored = 1;
+    js_on_error(msg ? msg : "(unknown)");
     lua_pop(L, 1);
 }
 
@@ -4437,7 +4459,7 @@ static int script_thread_run(int nargs) {
  * previous entry point is still suspended on a resource load (callbacks fired
  * in that window are dropped). */
 static lua_State *script_thread_begin(ScriptEntryPoint entry_point) {
-    if (!g_state.L || g_state.script_thread) {
+    if (!g_state.L || g_state.script_thread || g_state.errored) {
         return NULL;
     }
     lua_State *T;
@@ -4872,6 +4894,7 @@ static const char *project_bootstrap_source =
 static void close_lua_state(void) {
     /* Invalidate completions of any loads still in flight on the old state */
     g_state.generation++;
+    g_state.errored = 0;
 
     if (!g_state.L) {
         return;
@@ -4939,6 +4962,44 @@ static int finish_quit(void) {
     return 1;
 }
 
+/* love runs on LuaJIT, so games are written against Lua 5.1. LUA_COMPAT_ALL
+ * brings back most of what 5.2 dropped but not function environments, which
+ * are rebuilt on the _ENV upvalue. A function that reads no globals has no
+ * _ENV: setfenv leaves it alone and getfenv reports the globals table */
+static const char *compat_source =
+    "local debug = debug\n"
+    "local function env_upvalue(fn)\n"
+    "  local index = 1\n"
+    "  while true do\n"
+    "    local name = debug.getupvalue(fn, index)\n"
+    "    if name == '_ENV' then return index end\n"
+    "    if name == nil then return nil end\n"
+    "    index = index + 1\n"
+    "  end\n"
+    "end\n"
+    "local function resolve(fn, name)\n"
+    "  if type(fn) == 'function' then return fn end\n"
+    "  local info = debug.getinfo((fn or 1) + 2, 'f')\n"
+    "  if not info then error(\"bad argument #1 to '\" .. name .. \"' (invalid level)\", 3) end\n"
+    "  return info.func\n"
+    "end\n"
+    "function getfenv(fn)\n"
+    "  if fn == 0 then return _G end\n"
+    "  fn = resolve(fn, 'getfenv')\n"
+    "  local index = env_upvalue(fn)\n"
+    "  if not index then return _G end\n"
+    "  local _, env = debug.getupvalue(fn, index)\n"
+    "  return env\n"
+    "end\n"
+    "function setfenv(fn, env)\n"
+    "  fn = resolve(fn, 'setfenv')\n"
+    "  local index = env_upvalue(fn)\n"
+    "  if index then\n"
+    "    debug.upvaluejoin(fn, index, function() return env end, 1)\n"
+    "  end\n"
+    "  return fn\n"
+    "end\n";
+
 /* code is handed to the bootstrap as its argument when there is any */
 static int start_run(const char *bootstrap, const char *code) {
     close_lua_state();
@@ -4954,6 +5015,10 @@ static int start_run(const char *bootstrap, const char *code) {
 
     luaL_openlibs(g_state.L);
     register_aroma_api(g_state.L);
+    if (luaL_dostring(g_state.L, compat_source) != LUA_OK) {
+        report_lua_error(g_state.L);
+        return 1;
+    }
 
     /* Every run starts somewhere new, scripts that want a fixed run seed it */
     random_set_seed(&g_random, (uint64_t)emscripten_get_now() ^ ((uint64_t)(emscripten_random() * 4294967296.0) << 32));

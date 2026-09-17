@@ -71,9 +71,16 @@ initAroma(canvas).then((aroma) => {
   };
 
   runButton.addEventListener('click', () => {
+    projectStatus.className = '';
     projectStatus.textContent = '';
     runCode();
   });
+
+  // A run stops at its first Lua error
+  aroma.module.onError = (message) => {
+    projectStatus.className = 'error';
+    projectStatus.textContent = message;
+  };
 
   const runLove = async (file) => {
     projectStatus.className = '';
