@@ -66,6 +66,12 @@ typedef struct {
     Mat3 matrix_stack[STACK_MAX];
     int stack_top;
     double last_time;
+    double start_time;
+    float dt;
+    /* Frames per second, refreshed once a second like love's timer */
+    int fps;
+    int fps_frames;
+    double fps_window_start;
     int canvas_width;
     int canvas_height;
     AromaFont *current_font;
@@ -890,6 +896,21 @@ static int l_keyboard_isDown(lua_State *L) {
 }
 
 
+static int l_timer_getTime(lua_State *L) {
+    lua_pushnumber(L, (emscripten_get_now() - g_state.start_time) * 0.001);
+    return 1;
+}
+
+static int l_timer_getDelta(lua_State *L) {
+    lua_pushnumber(L, g_state.dt);
+    return 1;
+}
+
+static int l_timer_getFPS(lua_State *L) {
+    lua_pushinteger(L, g_state.fps);
+    return 1;
+}
+
 static void register_aroma_api(lua_State *L) {
     if (luaL_newmetatable(L, "aroma.image")) {
         lua_pushcfunction(L, l_image_gc);
@@ -973,6 +994,15 @@ static void register_aroma_api(lua_State *L) {
     lua_pushcfunction(L, l_keyboard_isDown);
     lua_setfield(L, -2, "isDown");
     lua_setfield(L, -2, "keyboard"); /* aroma.keyboard = table */
+
+    lua_newtable(L);                /* aroma.timer */
+    lua_pushcfunction(L, l_timer_getTime);
+    lua_setfield(L, -2, "getTime");
+    lua_pushcfunction(L, l_timer_getDelta);
+    lua_setfield(L, -2, "getDelta");
+    lua_pushcfunction(L, l_timer_getFPS);
+    lua_setfield(L, -2, "getFPS");
+    lua_setfield(L, -2, "timer");    /* aroma.timer = table */
 
     lua_setglobal(L, "aroma");
 
@@ -1282,6 +1312,14 @@ static void main_loop(void *userdata) {
     double now = emscripten_get_now();
     float dt = (float)((now - g_state.last_time) * 0.001);
     g_state.last_time = now;
+    g_state.dt = dt;
+
+    g_state.fps_frames++;
+    if (now - g_state.fps_window_start >= 1000.0) {
+        g_state.fps = (int)(g_state.fps_frames * 1000.0 / (now - g_state.fps_window_start) + 0.5);
+        g_state.fps_frames = 0;
+        g_state.fps_window_start = now;
+    }
 
     /* Leave a suspended entry point and its graphics stack untouched.
      * Resource completions drain independently of requestAnimationFrame. */
@@ -1388,6 +1426,8 @@ int main(void) {
     glGenBuffers(1, &g_state.vbo);
 
     g_state.last_time = emscripten_get_now();
+    g_state.start_time = g_state.last_time;
+    g_state.fps_window_start = g_state.last_time;
     emscripten_set_main_loop_arg(main_loop, NULL, 0, 1);
     return 0;
 }
