@@ -55,6 +55,19 @@ typedef struct {
     unsigned char *pixels;
 } AromaImageData;
 
+#define MESH_VERTEX_FLOATS 8
+
+/* Vertices are x, y, u, v, r, g, b, a. The copy in vertices is what getVertex
+ * reads and setVertex uploads from. The texture is anchored by the
+ * userdata's uservalue */
+typedef struct {
+    GLuint buffer;
+    GLenum mode;
+    int count;
+    float *vertices;
+    AromaImage *texture;
+} AromaMesh;
+
 /* sw, sh are the size of the texture that x, y, w, h were measured against */
 typedef struct {
     float x, y, w, h;
@@ -101,6 +114,9 @@ typedef struct {
     int canvas_ref;
     BlendMode blend_mode;
     BlendAlphaMode blend_alpha;
+    int scissor_enabled;
+    /* In the pixels of the target with y down, not GL's */
+    int scissor[4];
 } GraphicsState;
 
 typedef struct {
@@ -180,15 +196,19 @@ typedef struct {
 static EngineState g_state;
 
 static void apply_render_target(void);
+static void apply_scissor(void);
 static void apply_blend_mode(void);
 
 static const char *vertex_shader_source =
     "attribute vec2 aPosition;\n"
     "attribute vec2 aTexCoord;\n"
+    "attribute vec4 aColor;\n"
     "uniform mat3 uTransform;\n"
     "uniform mat3 uProjection;\n"
     "varying vec2 vTexCoord;\n"
+    "varying vec4 vColor;\n"
     "void main() {\n"
+    "  vColor = aColor;\n"
     "  vec3 world = uTransform * vec3(aPosition, 1.0);\n"
     "  vec3 clip = uProjection * world;\n"
     "  gl_Position = vec4(clip.xy, 0.0, 1.0);\n"
@@ -201,9 +221,10 @@ static const char *fragment_shader_source =
     "uniform sampler2D uTexture;\n"
     "uniform int uUseTexture;\n"
     "varying vec2 vTexCoord;\n"
+    "varying vec4 vColor;\n"
     "void main() {\n"
     "  vec4 tex = uUseTexture == 1 ? texture2D(uTexture, vTexCoord) : vec4(1.0);\n"
-    "  gl_FragColor = tex * uColor;\n"
+    "  gl_FragColor = tex * uColor * vColor;\n"
     "}\n";
 
 static void mat3_identity(Mat3 *m) {
@@ -642,6 +663,26 @@ static int l_graphics_rotate(lua_State *L) {
     return 0;
 }
 
+/* Sets up the shader for a draw with the current color. texture_id 0 draws
+ * untextured */
+static void begin_draw(const Mat3 *transform, int texture_id) {
+    glUseProgram(g_state.program);
+    glUniformMatrix3fv(g_state.transform_loc, 1, GL_FALSE, transform->m);
+    glUniformMatrix3fv(g_state.projection_loc, 1, GL_FALSE, g_state.projection);
+    glUniform4fv(g_state.color_loc, 1, g_state.gfx.draw_color);
+    if (g_state.use_texture_loc >= 0) {
+        glUniform1i(g_state.use_texture_loc, texture_id ? 1 : 0);
+    }
+
+    if (texture_id) {
+        glActiveTexture(GL_TEXTURE0);
+        js_bind_texture(texture_id);
+        if (g_state.sampler_loc >= 0) {
+            glUniform1i(g_state.sampler_loc, 0);
+        }
+    }
+}
+
 /* Vertex scratch space shared by the shape functions, grown on demand and
  * kept. Shapes are built and drawn within one call so nothing overlaps */
 static float *g_scratch[2];
@@ -664,13 +705,7 @@ static void draw_solid(const float *coords, int points, GLenum mode) {
         return;
     }
 
-    glUseProgram(g_state.program);
-    glUniformMatrix3fv(g_state.transform_loc, 1, GL_FALSE, current_matrix()->m);
-    glUniformMatrix3fv(g_state.projection_loc, 1, GL_FALSE, g_state.projection);
-    glUniform4fv(g_state.color_loc, 1, g_state.gfx.draw_color);
-    if (g_state.use_texture_loc >= 0) {
-        glUniform1i(g_state.use_texture_loc, 0);
-    }
+    begin_draw(current_matrix(), 0);
     glDisableVertexAttribArray(1);
     glVertexAttrib2f(1, 0.0f, 0.0f);
 
@@ -1429,19 +1464,7 @@ static void draw_text_lines(lua_State *L, AromaFont *font, const Mat3 *transform
         return;
     }
 
-    glUseProgram(g_state.program);
-    glUniformMatrix3fv(g_state.transform_loc, 1, GL_FALSE, transform->m);
-    glUniformMatrix3fv(g_state.projection_loc, 1, GL_FALSE, g_state.projection);
-    glUniform4fv(g_state.color_loc, 1, g_state.gfx.draw_color);
-    if (g_state.use_texture_loc >= 0) {
-        glUniform1i(g_state.use_texture_loc, 1);
-    }
-
-    glActiveTexture(GL_TEXTURE0);
-    js_bind_texture(font->texture_id);
-    if (g_state.sampler_loc >= 0) {
-        glUniform1i(g_state.sampler_loc, 0);
-    }
+    begin_draw(transform, font->texture_id);
 
     glBindBuffer(GL_ARRAY_BUFFER, g_state.vbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(float) * count * 4, vertices, GL_DYNAMIC_DRAW);
@@ -1455,8 +1478,14 @@ static void draw_text_lines(lua_State *L, AromaFont *font, const Mat3 *transform
     glDisableVertexAttribArray(1);
 }
 
-/* draw(image, [quad], x, y, r, sx, sy, ox, oy) */
+static int draw_mesh(lua_State *L);
+
+/* draw(image, [quad], x, y, r, sx, sy, ox, oy), or a mesh for the image */
 static int l_graphics_draw(lua_State *L) {
+    if (luaL_testudata(L, 1, "aroma.mesh")) {
+        return draw_mesh(L);
+    }
+
     AromaImage *img = check_texture(L, 1);
     if (img == g_state.gfx.canvas) {
         return luaL_error(L, "love.graphics.draw: a canvas can't be drawn to itself");
@@ -1507,19 +1536,7 @@ static int l_graphics_draw(lua_State *L) {
         0.0f, h,    u1, v2
     };
 
-    glUseProgram(g_state.program);
-    glUniformMatrix3fv(g_state.transform_loc, 1, GL_FALSE, final.m);
-    glUniformMatrix3fv(g_state.projection_loc, 1, GL_FALSE, g_state.projection);
-    glUniform4fv(g_state.color_loc, 1, g_state.gfx.draw_color);
-    if (g_state.use_texture_loc >= 0) {
-        glUniform1i(g_state.use_texture_loc, 1);
-    }
-
-    glActiveTexture(GL_TEXTURE0);
-    js_bind_texture(img->texture_id);
-    if (g_state.sampler_loc >= 0) {
-        glUniform1i(g_state.sampler_loc, 0);
-    }
+    begin_draw(&final, img->texture_id);
 
     glBindBuffer(GL_ARRAY_BUFFER, g_state.vbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_DYNAMIC_DRAW);
@@ -1532,6 +1549,201 @@ static int l_graphics_draw(lua_State *L) {
 
     glDisableVertexAttribArray(1);
     return 0;
+}
+
+static AromaMesh *check_mesh(lua_State *L, int idx) {
+    AromaMesh *mesh = (AromaMesh *)luaL_checkudata(L, idx, "aroma.mesh");
+    if (!mesh->vertices) {
+        luaL_error(L, "Mesh has been released");
+    }
+    return mesh;
+}
+
+/* A vertex is {x, y, u, v, r, g, b, a}, everything after y optional */
+static void read_mesh_vertex(lua_State *L, int idx, float *vertex) {
+    static const float defaults[MESH_VERTEX_FLOATS] = {0, 0, 0, 0, 1, 1, 1, 1};
+    luaL_checktype(L, idx, LUA_TTABLE);
+    for (int i = 0; i < MESH_VERTEX_FLOATS; i++) {
+        lua_rawgeti(L, idx, i + 1);
+        vertex[i] = (float)luaL_optnumber(L, -1, defaults[i]);
+        lua_pop(L, 1);
+    }
+}
+
+/* newMesh(vertices, [mode], [usage]) or newMesh(count, [mode], [usage]). Only
+ * love's standard vertex format, the usage hint is ignored */
+static int l_graphics_newMesh(lua_State *L) {
+    static const char *const modes[] = {"fan", "strip", "triangles", "points", NULL};
+    static const GLenum gl_modes[] = {GL_TRIANGLE_FAN, GL_TRIANGLE_STRIP, GL_TRIANGLES, GL_POINTS};
+
+    int from_table = lua_istable(L, 1);
+    int count = from_table ? (int)lua_rawlen(L, 1) : (int)luaL_checkinteger(L, 1);
+    luaL_argcheck(L, count > 0, 1, "a mesh needs at least 1 vertex");
+
+    if (from_table) {
+        /* A vertex format is a table of tables of strings, vertices of numbers */
+        lua_rawgeti(L, 1, 1);
+        if (lua_istable(L, -1)) {
+            lua_rawgeti(L, -1, 1);
+            if (lua_type(L, -1) == LUA_TSTRING) {
+                return luaL_error(L, "love.graphics.newMesh: custom vertex formats aren't supported yet");
+            }
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 1);
+    }
+
+    int mode = luaL_checkoption(L, 2, "fan", modes);
+
+    AromaMesh *mesh = (AromaMesh *)lua_newuserdata(L, sizeof(AromaMesh));
+    memset(mesh, 0, sizeof(AromaMesh));
+    luaL_getmetatable(L, "aroma.mesh");
+    lua_setmetatable(L, -2);
+
+    mesh->mode = gl_modes[mode];
+    mesh->count = count;
+    mesh->vertices = (float *)calloc((size_t)count, sizeof(float) * MESH_VERTEX_FLOATS);
+    if (!mesh->vertices) {
+        return luaL_error(L, "love.graphics.newMesh: out of memory");
+    }
+
+    for (int i = 0; i < count; i++) {
+        float *vertex = &mesh->vertices[i * MESH_VERTEX_FLOATS];
+        if (from_table) {
+            lua_rawgeti(L, 1, i + 1);
+            read_mesh_vertex(L, lua_gettop(L), vertex);
+            lua_pop(L, 1);
+        } else {
+            vertex[4] = vertex[5] = vertex[6] = vertex[7] = 1.0f;
+        }
+    }
+
+    glGenBuffers(1, &mesh->buffer);
+    glBindBuffer(GL_ARRAY_BUFFER, mesh->buffer);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(float) * MESH_VERTEX_FLOATS * count, mesh->vertices, GL_STATIC_DRAW);
+    return 1;
+}
+
+static int draw_mesh(lua_State *L) {
+    AromaMesh *mesh = check_mesh(L, 1);
+    float x = (float)luaL_optnumber(L, 2, 0.0);
+    float y = (float)luaL_optnumber(L, 3, 0.0);
+    float r = (float)luaL_optnumber(L, 4, 0.0);
+    float sx = (float)luaL_optnumber(L, 5, 1.0);
+    float sy = (float)luaL_optnumber(L, 6, sx);
+    float ox = (float)luaL_optnumber(L, 7, 0.0);
+    float oy = (float)luaL_optnumber(L, 8, 0.0);
+
+    AromaImage *texture = mesh->texture;
+    if (texture && texture == g_state.gfx.canvas) {
+        return luaL_error(L, "love.graphics.draw: a canvas can't be drawn to itself");
+    }
+
+    if (g_state.discard_rendering) {
+        return 0;
+    }
+
+    Mat3 final;
+    mat3_local(&final, current_matrix(), x, y, r, sx, sy, ox, oy);
+    /* A texture that was released draws as if there was none */
+    begin_draw(&final, texture && texture->loaded ? texture->texture_id : 0);
+
+    GLsizei stride = sizeof(float) * MESH_VERTEX_FLOATS;
+    glBindBuffer(GL_ARRAY_BUFFER, mesh->buffer);
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride, (const void *)0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, stride, (const void *)(sizeof(float) * 2));
+    glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, stride, (const void *)(sizeof(float) * 4));
+
+    glDrawArrays(mesh->mode, 0, mesh->count);
+
+    glDisableVertexAttribArray(1);
+    glDisableVertexAttribArray(2);
+    return 0;
+}
+
+static int l_mesh_setTexture(lua_State *L) {
+    AromaMesh *mesh = check_mesh(L, 1);
+    AromaImage *texture = lua_isnoneornil(L, 2) ? NULL : check_texture(L, 2);
+
+    lua_settop(L, 2);
+    if (texture) {
+        lua_createtable(L, 1, 0);
+        lua_pushvalue(L, 2);
+        lua_rawseti(L, -2, 1);
+    } else {
+        lua_pushnil(L);
+    }
+    lua_setuservalue(L, 1);
+    mesh->texture = texture;
+    return 0;
+}
+
+static int l_mesh_getTexture(lua_State *L) {
+    check_mesh(L, 1);
+    lua_getuservalue(L, 1);
+    if (!lua_istable(L, -1)) {
+        return 0;
+    }
+    lua_rawgeti(L, -1, 1);
+    return 1;
+}
+
+static int l_mesh_getVertexCount(lua_State *L) {
+    lua_pushinteger(L, check_mesh(L, 1)->count);
+    return 1;
+}
+
+static float *check_mesh_vertex(lua_State *L, AromaMesh *mesh, int idx) {
+    int index = (int)luaL_checkinteger(L, idx);
+    luaL_argcheck(L, index >= 1 && index <= mesh->count, idx, "vertex index out of range");
+    return &mesh->vertices[(index - 1) * MESH_VERTEX_FLOATS];
+}
+
+static int l_mesh_getVertex(lua_State *L) {
+    AromaMesh *mesh = check_mesh(L, 1);
+    float *vertex = check_mesh_vertex(L, mesh, 2);
+    for (int i = 0; i < MESH_VERTEX_FLOATS; i++) {
+        lua_pushnumber(L, vertex[i]);
+    }
+    return MESH_VERTEX_FLOATS;
+}
+
+/* setVertex(index, x, y, u, v, r, g, b, a) or setVertex(index, vertex) */
+static int l_mesh_setVertex(lua_State *L) {
+    AromaMesh *mesh = check_mesh(L, 1);
+    float *vertex = check_mesh_vertex(L, mesh, 2);
+
+    if (lua_istable(L, 3)) {
+        read_mesh_vertex(L, 3, vertex);
+    } else {
+        /* Components that aren't given keep their value, as in love */
+        for (int i = 0; i < MESH_VERTEX_FLOATS; i++) {
+            vertex[i] = (float)luaL_optnumber(L, 3 + i, vertex[i]);
+        }
+    }
+
+    glBindBuffer(GL_ARRAY_BUFFER, mesh->buffer);
+    glBufferSubData(GL_ARRAY_BUFFER, (char *)vertex - (char *)mesh->vertices,
+                    sizeof(float) * MESH_VERTEX_FLOATS, vertex);
+    return 0;
+}
+
+/* Also the __gc */
+static int l_mesh_release(lua_State *L) {
+    AromaMesh *mesh = (AromaMesh *)luaL_checkudata(L, 1, "aroma.mesh");
+    int had_vertices = mesh->vertices != NULL;
+    if (had_vertices) {
+        glDeleteBuffers(1, &mesh->buffer);
+        free(mesh->vertices);
+        mesh->vertices = NULL;
+        mesh->buffer = 0;
+        mesh->texture = NULL;
+    }
+    lua_pushboolean(L, had_vertices);
+    return 1;
 }
 
 /* newQuad(x, y, w, h, sw, sh), or a texture in place of sw, sh */
@@ -2021,6 +2233,78 @@ static void apply_render_target(void) {
     js_bind_framebuffer(canvas ? canvas->texture_id : 0);
     glViewport(0, 0, width, height);
     setup_projection((float)width, (float)height, canvas != NULL);
+    apply_scissor();
+}
+
+static void apply_scissor(void) {
+    if (!g_state.gl_context) {
+        return;
+    }
+
+    if (!g_state.gfx.scissor_enabled) {
+        glDisable(GL_SCISSOR_TEST);
+        return;
+    }
+
+    const int *box = g_state.gfx.scissor;
+    /* GL counts rows from the bottom of the window. A canvas is drawn into
+     * upside down, which makes its rows already count from the top */
+    int y = g_state.gfx.canvas ? box[1] : g_state.window_height - (box[1] + box[3]);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(box[0], y, box[2], box[3]);
+}
+
+static int set_scissor(lua_State *L, int intersect) {
+    GraphicsState *gfx = &g_state.gfx;
+
+    if (lua_gettop(L) == 0 && !intersect) {
+        gfx->scissor_enabled = 0;
+        apply_scissor();
+        return 0;
+    }
+
+    int x = (int)luaL_checknumber(L, 1);
+    int y = (int)luaL_checknumber(L, 2);
+    int w = (int)luaL_checknumber(L, 3);
+    int h = (int)luaL_checknumber(L, 4);
+    if (w < 0 || h < 0) {
+        return luaL_error(L, "Can't set scissor with negative width and/or height.");
+    }
+
+    if (intersect && gfx->scissor_enabled) {
+        int x2 = x + w < gfx->scissor[0] + gfx->scissor[2] ? x + w : gfx->scissor[0] + gfx->scissor[2];
+        int y2 = y + h < gfx->scissor[1] + gfx->scissor[3] ? y + h : gfx->scissor[1] + gfx->scissor[3];
+        if (x < gfx->scissor[0]) x = gfx->scissor[0];
+        if (y < gfx->scissor[1]) y = gfx->scissor[1];
+        w = x2 > x ? x2 - x : 0;
+        h = y2 > y ? y2 - y : 0;
+    }
+
+    gfx->scissor_enabled = 1;
+    gfx->scissor[0] = x;
+    gfx->scissor[1] = y;
+    gfx->scissor[2] = w;
+    gfx->scissor[3] = h;
+    apply_scissor();
+    return 0;
+}
+
+static int l_graphics_setScissor(lua_State *L) {
+    return set_scissor(L, 0);
+}
+
+static int l_graphics_intersectScissor(lua_State *L) {
+    return set_scissor(L, 1);
+}
+
+static int l_graphics_getScissor(lua_State *L) {
+    if (!g_state.gfx.scissor_enabled) {
+        return 0;
+    }
+    for (int i = 0; i < 4; i++) {
+        lua_pushinteger(L, g_state.gfx.scissor[i]);
+    }
+    return 4;
 }
 
 /* The blend functions are love's, so that results match it */
@@ -2619,6 +2903,28 @@ static void register_aroma_api(lua_State *L) {
     }
     lua_pop(L, 1);
 
+    if (luaL_newmetatable(L, "aroma.mesh")) {
+        lua_pushcfunction(L, l_mesh_release);
+        lua_setfield(L, -2, "__gc");
+
+        lua_newtable(L);
+        lua_pushcfunction(L, l_mesh_setTexture);
+        lua_setfield(L, -2, "setTexture");
+        lua_pushcfunction(L, l_mesh_getTexture);
+        lua_setfield(L, -2, "getTexture");
+        lua_pushcfunction(L, l_mesh_getVertexCount);
+        lua_setfield(L, -2, "getVertexCount");
+        lua_pushcfunction(L, l_mesh_getVertex);
+        lua_setfield(L, -2, "getVertex");
+        lua_pushcfunction(L, l_mesh_setVertex);
+        lua_setfield(L, -2, "setVertex");
+        lua_pushcfunction(L, l_mesh_release);
+        lua_setfield(L, -2, "release");
+        register_object_type(L, (const char *const[]){"Mesh", "Drawable", "Object", NULL});
+        lua_setfield(L, -2, "__index");
+    }
+    lua_pop(L, 1);
+
     if (luaL_newmetatable(L, "aroma.image_data")) {
         lua_pushcfunction(L, l_imagedata_release);
         lua_setfield(L, -2, "__gc");
@@ -2761,6 +3067,9 @@ static void register_aroma_api(lua_State *L) {
     lua_pushcfunction(L, l_graphics_newQuad);
     lua_setfield(L, -2, "newQuad");
 
+    lua_pushcfunction(L, l_graphics_newMesh);
+    lua_setfield(L, -2, "newMesh");
+
     lua_pushcfunction(L, l_graphics_newCanvas);
     lua_setfield(L, -2, "newCanvas");
 
@@ -2772,6 +3081,15 @@ static void register_aroma_api(lua_State *L) {
 
     lua_pushcfunction(L, l_graphics_clear);
     lua_setfield(L, -2, "clear");
+
+    lua_pushcfunction(L, l_graphics_setScissor);
+    lua_setfield(L, -2, "setScissor");
+
+    lua_pushcfunction(L, l_graphics_intersectScissor);
+    lua_setfield(L, -2, "intersectScissor");
+
+    lua_pushcfunction(L, l_graphics_getScissor);
+    lua_setfield(L, -2, "getScissor");
 
     lua_pushcfunction(L, l_graphics_setBlendMode);
     lua_setfield(L, -2, "setBlendMode");
@@ -3124,6 +3442,7 @@ static int init_program(void) {
     glAttachShader(g_state.program, fs);
     glBindAttribLocation(g_state.program, 0, "aPosition");
     glBindAttribLocation(g_state.program, 1, "aTexCoord");
+    glBindAttribLocation(g_state.program, 2, "aColor");
     glLinkProgram(g_state.program);
 
     GLint status = GL_FALSE;
@@ -3140,6 +3459,10 @@ static int init_program(void) {
     g_state.color_loc = glGetUniformLocation(g_state.program, "uColor");
     g_state.use_texture_loc = glGetUniformLocation(g_state.program, "uUseTexture");
     g_state.sampler_loc = glGetUniformLocation(g_state.program, "uTexture");
+
+    /* Only meshes have colors of their own. Everything else leaves the array
+     * off and gets this constant */
+    glVertexAttrib4f(2, 1.0f, 1.0f, 1.0f, 1.0f);
 
     glUseProgram(g_state.program);
     if (g_state.sampler_loc >= 0) {
@@ -3223,6 +3546,7 @@ static void default_graphics_state(void) {
     gfx->canvas_ref = LUA_NOREF;
     gfx->blend_mode = BLEND_ALPHA;
     gfx->blend_alpha = BLEND_ALPHA_MULTIPLY;
+    gfx->scissor_enabled = 0;
     g_state.default_min = FILTER_LINEAR;
     g_state.default_mag = FILTER_LINEAR;
 

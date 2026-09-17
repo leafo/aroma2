@@ -9,6 +9,7 @@
 --   h          hide / show the cursor
 --   w          switch the window between 800x600 and 640x480
 --   s          reseed the terrain
+--   m          shatter the image into meshes
 --   f          switch the image between nearest and linear filtering
 --   space      hold to spin faster
 --   escape     quit, the first press is refused by love.quit
@@ -18,6 +19,8 @@ local g = love.graphics
 local font
 local image, image_quad
 local pixel_canvas
+local shards, shatter_time
+local shatter
 local seed = 1
 local terrain = {}
 local dots = {}
@@ -57,6 +60,14 @@ function love.load()
 end
 
 function love.update(dt)
+  if shards then
+    shatter_time = shatter_time + dt
+    if shatter_time > 1.5 then
+      for _, shard in ipairs(shards) do shard.mesh:release() end
+      shards = nil
+    end
+  end
+
   spin = spin + dt * (love.keyboard.isDown("space") and 6 or 1)
 end
 
@@ -80,6 +91,8 @@ function love.keypressed(key, scancode, isrepeat)
     end
   elseif key == "f" and not isrepeat then
     image:setFilter(image:getFilter() == "linear" and "nearest" or "linear")
+  elseif key == "m" and not isrepeat then
+    shatter()
   elseif key == "s" then
     seed = seed + 1
     build_terrain()
@@ -111,6 +124,42 @@ function love.quit()
     quit_armed = true
     last_event = "love.quit refused, escape again to really quit"
     return true
+  end
+end
+
+-- cuts the quad's square of the image into wedges around a point near the
+-- middle, each a fan mesh textured with its own part of the image
+function shatter()
+  local qx, qy, qw, qh = image_quad:getViewport()
+  local iw, ih = image:getDimensions()
+  local cx, cy = qw * (0.35 + love.math.random() * 0.3), qh * (0.35 + love.math.random() * 0.3)
+  local function vertex(x, y) return {x, y, (qx + x) / iw, (qy + y) / ih} end
+
+  -- how far from the break the edge of the square is in a direction
+  local function to_edge(dx, dy)
+    local tx = dx > 0 and (qw - cx) / dx or dx < 0 and -cx / dx or math.huge
+    local ty = dy > 0 and (qh - cy) / dy or dy < 0 and -cy / dy or math.huge
+    return math.min(tx, ty)
+  end
+
+  shards = {}
+  shatter_time = 0
+  local count = love.math.random(5, 8)
+  local start = love.math.random() * math.pi * 2
+  for i = 1, count do
+    local a1 = start + (i - 1) / count * math.pi * 2
+    local a2 = start + i / count * math.pi * 2
+    local verts = {vertex(cx, cy)}
+    -- enough steps that the corners of the square aren't cut off
+    for step = 0, 8 do
+      local a = a1 + (a2 - a1) * step / 8
+      local dx, dy = math.cos(a), math.sin(a)
+      local t = to_edge(dx, dy)
+      verts[#verts + 1] = vertex(cx + dx * t, cy + dy * t)
+    end
+    local mesh = g.newMesh(verts, "fan", "static")
+    mesh:setTexture(image)
+    shards[i] = {mesh = mesh, dir = (a1 + a2) / 2, spin = (love.math.random() - 0.5) * 3, cx = cx, cy = cy}
   end
 end
 
@@ -196,7 +245,19 @@ function love.draw()
   -- a quad cuts the middle out of the image, drawn big enough to show the filter
   local _, _, qw, qh = image_quad:getViewport()
   g.setColor(1, 1, 1)
-  g.draw(image, image_quad, 130, 270, math.sin(spin * 0.5) * 0.1, 1.5, 1.5, qw / 2, qh / 2)
+  if shards then
+    -- each shard turns about the break point while it drifts away from it
+    g.setColor(1, 1, 1, 1 - shatter_time / 1.5)
+    for _, shard in ipairs(shards) do
+      local d = shatter_time * 80
+      local x = 130 + (shard.cx - qw / 2) * 1.5 + math.cos(shard.dir) * d
+      local y = 270 + (shard.cy - qh / 2) * 1.5 + math.sin(shard.dir) * d
+      g.draw(shard.mesh, x, y, shard.spin * shatter_time, 1.5, 1.5, shard.cx, shard.cy)
+    end
+    g.setColor(1, 1, 1)
+  else
+    g.draw(image, image_quad, 130, 270, math.sin(spin * 0.5) * 0.1, 1.5, 1.5, qw / 2, qh / 2)
+  end
   g.print((image:getFilter()), 40, 340)
 
   -- a canvas holds colors already multiplied by their alpha, so it's drawn
