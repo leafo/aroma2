@@ -46,6 +46,22 @@ typedef struct {
     int loaded;
 } AromaFont;
 
+/* What push("all") saves next to the transform */
+typedef struct {
+    float draw_color[4];
+    float bg_color[4];
+    float line_width;
+    AromaFont *font;
+    int font_ref;
+} GraphicsState;
+
+typedef struct {
+    Mat3 matrix;
+    /* Set for push("all"), pop then puts saved back */
+    int has_state;
+    GraphicsState saved;
+} StackEntry;
+
 typedef enum {
     SCRIPT_ENTRY_NONE,
     SCRIPT_ENTRY_BOOTSTRAP,
@@ -68,9 +84,8 @@ typedef struct {
     GLint use_texture_loc;
     GLint sampler_loc;
     float projection[9];
-    float bg_color[4];
-    float draw_color[4];
-    Mat3 matrix_stack[STACK_MAX];
+    GraphicsState gfx;
+    StackEntry stack[STACK_MAX];
     int stack_top;
     double last_time;
     double start_time;
@@ -81,8 +96,6 @@ typedef struct {
     double fps_window_start;
     int canvas_width;
     int canvas_height;
-    AromaFont *current_font;
-    int current_font_ref;
     /* Guards async load completions against a Lua state that was closed and
      * recreated while the load was in flight. */
     int generation;
@@ -330,7 +343,7 @@ static void parse_color(lua_State *L, int idx, float out[4]) {
 }
 
 static Mat3 *current_matrix(void) {
-    return &g_state.matrix_stack[g_state.stack_top];
+    return &g_state.stack[g_state.stack_top].matrix;
 }
 
 static AromaImage *check_image(lua_State *L, int idx) {
@@ -342,36 +355,88 @@ static AromaFont *check_font(lua_State *L, int idx) {
 }
 
 static int l_graphics_setBackgroundColor(lua_State *L) {
-    parse_color(L, 1, g_state.bg_color);
+    parse_color(L, 1, g_state.gfx.bg_color);
     return 0;
+}
+
+static int l_graphics_getBackgroundColor(lua_State *L) {
+    for (int i = 0; i < 4; i++) {
+        lua_pushnumber(L, g_state.gfx.bg_color[i]);
+    }
+    return 4;
 }
 
 static int l_graphics_getColor(lua_State *L) {
     for (int i = 0; i < 4; i++) {
-        lua_pushnumber(L, g_state.draw_color[i]);
+        lua_pushnumber(L, g_state.gfx.draw_color[i]);
     }
     return 4;
 }
 
 static int l_graphics_setColor(lua_State *L) {
-    parse_color(L, 1, g_state.draw_color);
+    parse_color(L, 1, g_state.gfx.draw_color);
     return 0;
 }
 
 static int l_graphics_push(lua_State *L) {
+    static const char *const kinds[] = {"transform", "all", NULL};
+    int all = luaL_checkoption(L, 1, "transform", kinds);
+
     if (g_state.stack_top + 1 >= STACK_MAX) {
         return luaL_error(L, "love.graphics.push: stack overflow");
     }
-    mat3_copy(&g_state.matrix_stack[g_state.stack_top + 1], current_matrix());
+
+    StackEntry *entry = &g_state.stack[g_state.stack_top + 1];
+    mat3_copy(&entry->matrix, current_matrix());
+    entry->has_state = all;
+    if (all) {
+        entry->saved = g_state.gfx;
+        /* The saved font needs an anchor of its own, setFont releases the
+         * active one */
+        if (g_state.gfx.font_ref != LUA_NOREF) {
+            lua_rawgeti(L, LUA_REGISTRYINDEX, g_state.gfx.font_ref);
+            entry->saved.font_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        }
+    }
     g_state.stack_top++;
     return 0;
+}
+
+static void release_font_ref(lua_State *L) {
+    if (g_state.gfx.font_ref != LUA_NOREF) {
+        luaL_unref(L, LUA_REGISTRYINDEX, g_state.gfx.font_ref);
+        g_state.gfx.font_ref = LUA_NOREF;
+    }
+}
+
+static void pop_stack_entry(lua_State *L) {
+    StackEntry *entry = &g_state.stack[g_state.stack_top];
+    if (entry->has_state) {
+        release_font_ref(L);
+        g_state.gfx = entry->saved;
+        entry->has_state = 0;
+    }
+    g_state.stack_top--;
 }
 
 static int l_graphics_pop(lua_State *L) {
     if (g_state.stack_top == 0) {
         return luaL_error(L, "love.graphics.pop: stack underflow");
     }
-    g_state.stack_top--;
+    pop_stack_entry(L);
+    return 0;
+}
+
+static int l_graphics_origin(lua_State *L) {
+    (void)L;
+    mat3_identity(current_matrix());
+    return 0;
+}
+
+static int l_graphics_scale(lua_State *L) {
+    float sx = (float)luaL_checknumber(L, 1);
+    float sy = (float)luaL_optnumber(L, 2, sx);
+    mat3_scale(current_matrix(), sx, sy);
     return 0;
 }
 
@@ -388,37 +453,33 @@ static int l_graphics_rotate(lua_State *L) {
     return 0;
 }
 
-static int l_graphics_polygon(lua_State *L) {
-    const char *mode = luaL_checkstring(L, 1);
-    if (strcmp(mode, "fill") != 0) {
-        return luaL_error(L, "love.graphics.polygon: only 'fill' supported");
-    }
+/* Vertex scratch space shared by the shape functions, grown on demand and
+ * kept. Shapes are built and drawn within one call so nothing overlaps */
+static float *g_scratch[2];
+static int g_scratch_capacity[2];
 
-    int args = lua_gettop(L) - 1;
-    if (args < 6 || (args % 2) != 0) {
-        return luaL_error(L, "love.graphics.polygon: need pairs of coordinates");
+static float *scratch_floats(lua_State *L, int slot, int count) {
+    if (count > g_scratch_capacity[slot]) {
+        float *grown = (float *)realloc(g_scratch[slot], sizeof(float) * count);
+        if (!grown) {
+            luaL_error(L, "out of memory");
+        }
+        g_scratch[slot] = grown;
+        g_scratch_capacity[slot] = count;
     }
+    return g_scratch[slot];
+}
 
-    int points = args / 2;
-    float *coords = (float *)malloc(sizeof(float) * points * 2);
-    if (!coords) {
-        return luaL_error(L, "love.graphics.polygon: out of memory");
-    }
-
-    for (int i = 0; i < points; ++i) {
-        coords[i * 2 + 0] = (float)luaL_checknumber(L, 2 + i * 2);
-        coords[i * 2 + 1] = (float)luaL_checknumber(L, 3 + i * 2);
-    }
-
-    if (g_state.discard_rendering) {
-        free(coords);
-        return 0;
+/* Draws untextured x, y pairs in the current color and transform */
+static void draw_solid(const float *coords, int points, GLenum mode) {
+    if (g_state.discard_rendering || points <= 0) {
+        return;
     }
 
     glUseProgram(g_state.program);
     glUniformMatrix3fv(g_state.transform_loc, 1, GL_FALSE, current_matrix()->m);
     glUniformMatrix3fv(g_state.projection_loc, 1, GL_FALSE, g_state.projection);
-    glUniform4fv(g_state.color_loc, 1, g_state.draw_color);
+    glUniform4fv(g_state.color_loc, 1, g_state.gfx.draw_color);
     if (g_state.use_texture_loc >= 0) {
         glUniform1i(g_state.use_texture_loc, 0);
     }
@@ -430,10 +491,255 @@ static int l_graphics_polygon(lua_State *L) {
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (const void *)0);
 
-    glDrawArrays(GL_TRIANGLE_FAN, 0, points);
+    glDrawArrays(mode, 0, points);
+}
 
-    free(coords);
+/* How far a miter may reach past the line's half width before it's cut
+ * short, the tip of a very sharp corner would otherwise run off to infinity */
+#define MITER_LIMIT 8.0f
+
+/* WebGL only has 1 pixel lines, so lines are built as a triangle strip with
+ * mitered corners. The width is in the units of the current transform, like
+ * love's. closed joins the last point back to the first */
+static void draw_polyline(lua_State *L, const float *coords, int points, int closed) {
+    /* Closing point given twice, as love's polygon vertices allow */
+    if (closed && points > 1 &&
+        coords[0] == coords[(points - 1) * 2] && coords[1] == coords[(points - 1) * 2 + 1]) {
+        points--;
+    }
+
+    if (points < 2) {
+        return;
+    }
+
+    if (points == 2) {
+        closed = 0;
+    }
+
+    float half = g_state.gfx.line_width * 0.5f;
+    int pairs = closed ? points + 1 : points;
+    float *strip = scratch_floats(L, 1, pairs * 4);
+
+    for (int n = 0; n < pairs; n++) {
+        int i = n % points;
+        int has_prev = closed || i > 0;
+        int has_next = closed || i < points - 1;
+        const float *p = &coords[i * 2];
+        const float *prev = &coords[((i + points - 1) % points) * 2];
+        const float *next = &coords[((i + 1) % points) * 2];
+
+        /* Unit normals of the segments into and out of this point */
+        float in_x = 0.0f, in_y = 0.0f, out_x = 0.0f, out_y = 0.0f;
+        if (has_prev) {
+            float dx = p[0] - prev[0], dy = p[1] - prev[1];
+            float len = sqrtf(dx * dx + dy * dy);
+            if (len > 0.0f) { in_x = -dy / len; in_y = dx / len; } else { has_prev = 0; }
+        }
+        if (has_next) {
+            float dx = next[0] - p[0], dy = next[1] - p[1];
+            float len = sqrtf(dx * dx + dy * dy);
+            if (len > 0.0f) { out_x = -dy / len; out_y = dx / len; } else { has_next = 0; }
+        }
+        if (!has_prev) { in_x = out_x; in_y = out_y; }
+        if (!has_next) { out_x = in_x; out_y = in_y; }
+
+        float mx = in_x + out_x, my = in_y + out_y;
+        float mlen = sqrtf(mx * mx + my * my);
+        float reach = half;
+        if (mlen > 0.0001f) {
+            mx /= mlen;
+            my /= mlen;
+            float cos_half = mx * in_x + my * in_y;
+            reach = cos_half > 1.0f / MITER_LIMIT ? half / cos_half : half * MITER_LIMIT;
+        } else {
+            /* Doubles straight back on itself */
+            mx = in_x;
+            my = in_y;
+        }
+
+        strip[n * 4 + 0] = p[0] + mx * reach;
+        strip[n * 4 + 1] = p[1] + my * reach;
+        strip[n * 4 + 2] = p[0] - mx * reach;
+        strip[n * 4 + 3] = p[1] - my * reach;
+    }
+
+    draw_solid(strip, pairs * 2, GL_TRIANGLE_STRIP);
+}
+
+static int check_draw_mode(lua_State *L, int idx) {
+    static const char *const modes[] = {"fill", "line", NULL};
+    return luaL_checkoption(L, idx, NULL, modes);
+}
+
+/* Reads x, y pairs given as arguments from idx on, or as one table there.
+ * Returns the number of points, the coordinates land in scratch slot 0 */
+static int read_points(lua_State *L, int idx, const char *what, float **out) {
+    int from_table = lua_istable(L, idx);
+    int count = from_table ? (int)lua_rawlen(L, idx) : lua_gettop(L) - idx + 1;
+
+    if (count % 2 != 0) {
+        luaL_error(L, "%s: coordinates must come in pairs", what);
+    }
+
+    float *coords = scratch_floats(L, 0, count > 0 ? count : 1);
+    for (int i = 0; i < count; i++) {
+        if (from_table) {
+            lua_rawgeti(L, idx, i + 1);
+            coords[i] = (float)luaL_checknumber(L, -1);
+            lua_pop(L, 1);
+        } else {
+            coords[i] = (float)luaL_checknumber(L, idx + i);
+        }
+    }
+
+    *out = coords;
+    return count / 2;
+}
+
+/* Filled polygons are drawn as a fan and so have to be convex, as in love */
+static void draw_outline(lua_State *L, int fill, const float *coords, int points) {
+    if (fill) {
+        draw_solid(coords, points, GL_TRIANGLE_FAN);
+    } else {
+        draw_polyline(L, coords, points, 1);
+    }
+}
+
+static int l_graphics_polygon(lua_State *L) {
+    int fill = check_draw_mode(L, 1) == 0;
+    float *coords;
+    int points = read_points(L, 2, "love.graphics.polygon", &coords);
+    if (points < 3) {
+        return luaL_error(L, "love.graphics.polygon: need at least 3 points");
+    }
+    draw_outline(L, fill, coords, points);
     return 0;
+}
+
+static int l_graphics_line(lua_State *L) {
+    float *coords;
+    int points = read_points(L, 1, "love.graphics.line", &coords);
+    if (points < 2) {
+        return luaL_error(L, "love.graphics.line: need at least 2 points");
+    }
+    draw_polyline(L, coords, points, 0);
+    return 0;
+}
+
+/* Segments for a full turn of a curve, more as it gets bigger on screen */
+static int curve_segments(float rx, float ry) {
+    const float *m = current_matrix()->m;
+    float scale = sqrtf(fabsf(m[0] * m[4] - m[1] * m[3]));
+    int segments = (int)sqrtf((fabsf(rx) + fabsf(ry)) * 0.5f * 20.0f * scale);
+    return segments < 8 ? 8 : segments;
+}
+
+static void draw_ellipse(lua_State *L, int fill, float x, float y, float rx, float ry, int segments) {
+    if (segments < 3) {
+        segments = 3;
+    }
+
+    float *coords = scratch_floats(L, 0, segments * 2);
+    for (int i = 0; i < segments; i++) {
+        float angle = (float)i / segments * 2.0f * (float)M_PI;
+        coords[i * 2 + 0] = x + cosf(angle) * rx;
+        coords[i * 2 + 1] = y + sinf(angle) * ry;
+    }
+    draw_outline(L, fill, coords, segments);
+}
+
+static int l_graphics_circle(lua_State *L) {
+    int fill = check_draw_mode(L, 1) == 0;
+    float x = (float)luaL_checknumber(L, 2);
+    float y = (float)luaL_checknumber(L, 3);
+    float radius = (float)luaL_checknumber(L, 4);
+    int segments = (int)luaL_optinteger(L, 5, curve_segments(radius, radius));
+    draw_ellipse(L, fill, x, y, radius, radius, segments);
+    return 0;
+}
+
+static int l_graphics_ellipse(lua_State *L) {
+    int fill = check_draw_mode(L, 1) == 0;
+    float x = (float)luaL_checknumber(L, 2);
+    float y = (float)luaL_checknumber(L, 3);
+    float rx = (float)luaL_checknumber(L, 4);
+    float ry = (float)luaL_checknumber(L, 5);
+    int segments = (int)luaL_optinteger(L, 6, curve_segments(rx, ry));
+    draw_ellipse(L, fill, x, y, rx, ry, segments);
+    return 0;
+}
+
+/* arc(mode, [arctype], x, y, radius, angle1, angle2, [segments]). A pie
+ * closes through the center, closed straight across, open not at all */
+static int l_graphics_arc(lua_State *L) {
+    static const char *const types[] = {"pie", "open", "closed", NULL};
+    enum { ARC_PIE, ARC_OPEN, ARC_CLOSED };
+
+    int fill = check_draw_mode(L, 1) == 0;
+    int type = ARC_PIE;
+    int idx = 2;
+    if (lua_type(L, 2) == LUA_TSTRING) {
+        type = luaL_checkoption(L, 2, NULL, types);
+        idx = 3;
+    }
+
+    float x = (float)luaL_checknumber(L, idx);
+    float y = (float)luaL_checknumber(L, idx + 1);
+    float radius = (float)luaL_checknumber(L, idx + 2);
+    float angle1 = (float)luaL_checknumber(L, idx + 3);
+    float angle2 = (float)luaL_checknumber(L, idx + 4);
+
+    float sweep = angle2 - angle1;
+    if (sweep == 0.0f) {
+        return 0;
+    }
+
+    int full_turn = curve_segments(radius, radius);
+    if (fabsf(sweep) >= 2.0f * (float)M_PI) {
+        /* All the way around, the ends would only overlap */
+        draw_ellipse(L, fill, x, y, radius, radius, (int)luaL_optinteger(L, idx + 5, full_turn));
+        return 0;
+    }
+
+    int default_segments = (int)ceilf(full_turn * fabsf(sweep) / (2.0f * (float)M_PI));
+    int segments = (int)luaL_optinteger(L, idx + 5, default_segments);
+    if (segments < 1) {
+        segments = 1;
+    }
+
+    /* Room for the center point of a pie in front of the curve */
+    float *coords = scratch_floats(L, 0, (segments + 2) * 2);
+    int points = 0;
+    if (type == ARC_PIE) {
+        coords[0] = x;
+        coords[1] = y;
+        points = 1;
+    }
+    for (int i = 0; i <= segments; i++) {
+        float angle = angle1 + sweep * i / segments;
+        coords[points * 2 + 0] = x + cosf(angle) * radius;
+        coords[points * 2 + 1] = y + sinf(angle) * radius;
+        points++;
+    }
+
+    if (fill) {
+        draw_solid(coords, points, GL_TRIANGLE_FAN);
+    } else {
+        draw_polyline(L, coords, points, type != ARC_OPEN);
+    }
+    return 0;
+}
+
+static int l_graphics_setLineWidth(lua_State *L) {
+    float width = (float)luaL_checknumber(L, 1);
+    luaL_argcheck(L, width > 0.0f, 1, "line width must be positive");
+    g_state.gfx.line_width = width;
+    return 0;
+}
+
+static int l_graphics_getLineWidth(lua_State *L) {
+    lua_pushnumber(L, g_state.gfx.line_width);
+    return 1;
 }
 
 static int l_graphics_newImage_cont(lua_State *L) {
@@ -602,7 +908,7 @@ static int l_graphics_draw(lua_State *L) {
     glUseProgram(g_state.program);
     glUniformMatrix3fv(g_state.transform_loc, 1, GL_FALSE, final.m);
     glUniformMatrix3fv(g_state.projection_loc, 1, GL_FALSE, g_state.projection);
-    glUniform4fv(g_state.color_loc, 1, g_state.draw_color);
+    glUniform4fv(g_state.color_loc, 1, g_state.gfx.draw_color);
     if (g_state.use_texture_loc >= 0) {
         glUniform1i(g_state.use_texture_loc, 1);
     }
@@ -643,51 +949,20 @@ static int l_graphics_getDimensions(lua_State *L) {
 }
 
 static int l_graphics_rectangle(lua_State *L) {
-    const char *mode = luaL_checkstring(L, 1);
-
+    int fill = check_draw_mode(L, 1) == 0;
     float x = (float)luaL_checknumber(L, 2);
     float y = (float)luaL_checknumber(L, 3);
     float w = (float)luaL_checknumber(L, 4);
     float h = (float)luaL_checknumber(L, 5);
 
-    if (strcmp(mode, "fill") != 0 && strcmp(mode, "line") != 0) {
-        return luaL_error(L, "love.graphics.rectangle: mode must be 'fill' or 'line'");
-    }
-
-    if (g_state.discard_rendering) {
-        return 0;
-    }
-
-    // Create 5 vertices for the rectangle (last point closes the loop)
-    float coords[10] = {
+    float coords[8] = {
         x, y,
         x, y + h,
         x + w, y + h,
-        x + w, y,
-        x, y
+        x + w, y
     };
 
-    glUseProgram(g_state.program);
-    glUniformMatrix3fv(g_state.transform_loc, 1, GL_FALSE, current_matrix()->m);
-    glUniformMatrix3fv(g_state.projection_loc, 1, GL_FALSE, g_state.projection);
-    glUniform4fv(g_state.color_loc, 1, g_state.draw_color);
-    if (g_state.use_texture_loc >= 0) {
-        glUniform1i(g_state.use_texture_loc, 0);
-    }
-    glDisableVertexAttribArray(1);
-    glVertexAttrib2f(1, 0.0f, 0.0f);
-
-    glBindBuffer(GL_ARRAY_BUFFER, g_state.vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(coords), coords, GL_DYNAMIC_DRAW);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (const void *)0);
-
-    if (strcmp(mode, "fill") == 0) {
-        glDrawArrays(GL_TRIANGLE_FAN, 0, 5);
-    } else if (strcmp(mode, "line") == 0) {
-        glDrawArrays(GL_LINE_STRIP, 0, 5);
-    }
-
+    draw_outline(L, fill, coords, 4);
     return 0;
 }
 
@@ -752,20 +1027,17 @@ static int l_graphics_newImageFont(lua_State *L) {
 static int l_graphics_setFont(lua_State *L) {
     /* The active font is anchored in the registry so it survives even when
      * the script drops its last reference to the userdata. */
-    if (g_state.current_font_ref != LUA_NOREF) {
-        luaL_unref(L, LUA_REGISTRYINDEX, g_state.current_font_ref);
-        g_state.current_font_ref = LUA_NOREF;
-    }
+    release_font_ref(L);
 
     if (lua_isnoneornil(L, 1)) {
-        g_state.current_font = NULL;
+        g_state.gfx.font = NULL;
         return 0;
     }
 
     AromaFont *font = check_font(L, 1);
     lua_pushvalue(L, 1);
-    g_state.current_font_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    g_state.current_font = font;
+    g_state.gfx.font_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    g_state.gfx.font = font;
     return 0;
 }
 
@@ -774,7 +1046,7 @@ static int l_graphics_print(lua_State *L) {
     float x = (float)luaL_optnumber(L, 2, 0.0);
     float y = (float)luaL_optnumber(L, 3, 0.0);
 
-    AromaFont *font = g_state.current_font;
+    AromaFont *font = g_state.gfx.font;
     if (!font || !font->loaded || font->texture_id == 0 || font->glyph_count == 0) {
         return 0;
     }
@@ -875,7 +1147,7 @@ static int l_graphics_print(lua_State *L) {
         glUseProgram(g_state.program);
         glUniformMatrix3fv(g_state.transform_loc, 1, GL_FALSE, current_matrix()->m);
         glUniformMatrix3fv(g_state.projection_loc, 1, GL_FALSE, g_state.projection);
-        glUniform4fv(g_state.color_loc, 1, g_state.draw_color);
+        glUniform4fv(g_state.color_loc, 1, g_state.gfx.draw_color);
         if (g_state.use_texture_loc >= 0) {
             glUniform1i(g_state.use_texture_loc, 1);
         }
@@ -918,8 +1190,8 @@ static int l_font_gc(lua_State *L) {
     font->image_height = 0;
     font->line_height = 0.0f;
     font->loaded = 0;
-    if (g_state.current_font == font) {
-        g_state.current_font = NULL;
+    if (g_state.gfx.font == font) {
+        g_state.gfx.font = NULL;
     }
     return 0;
 }
@@ -1426,6 +1698,33 @@ static void register_aroma_api(lua_State *L) {
     lua_pushcfunction(L, l_graphics_polygon);
     lua_setfield(L, -2, "polygon");
 
+    lua_pushcfunction(L, l_graphics_getBackgroundColor);
+    lua_setfield(L, -2, "getBackgroundColor");
+
+    lua_pushcfunction(L, l_graphics_origin);
+    lua_setfield(L, -2, "origin");
+
+    lua_pushcfunction(L, l_graphics_scale);
+    lua_setfield(L, -2, "scale");
+
+    lua_pushcfunction(L, l_graphics_line);
+    lua_setfield(L, -2, "line");
+
+    lua_pushcfunction(L, l_graphics_circle);
+    lua_setfield(L, -2, "circle");
+
+    lua_pushcfunction(L, l_graphics_ellipse);
+    lua_setfield(L, -2, "ellipse");
+
+    lua_pushcfunction(L, l_graphics_arc);
+    lua_setfield(L, -2, "arc");
+
+    lua_pushcfunction(L, l_graphics_setLineWidth);
+    lua_setfield(L, -2, "setLineWidth");
+
+    lua_pushcfunction(L, l_graphics_getLineWidth);
+    lua_setfield(L, -2, "getLineWidth");
+
     lua_pushcfunction(L, l_graphics_newImage);
     lua_setfield(L, -2, "newImage");
 
@@ -1828,9 +2127,28 @@ static int init_webgl(void) {
     return 1;
 }
 
+/* Every frame starts from an empty stack, a push left open by the last one
+ * is popped so what push("all") saved isn't lost with it */
 static void reset_graphics_state(void) {
+    while (g_state.stack_top > 0) {
+        pop_stack_entry(g_state.L);
+    }
+    mat3_identity(&g_state.stack[0].matrix);
+}
+
+static void default_graphics_state(void) {
+    GraphicsState *gfx = &g_state.gfx;
+    gfx->bg_color[0] = gfx->bg_color[1] = gfx->bg_color[2] = 0.0f;
+    gfx->bg_color[3] = 1.0f;
+    gfx->draw_color[0] = gfx->draw_color[1] = gfx->draw_color[2] = gfx->draw_color[3] = 1.0f;
+    gfx->line_width = 1.0f;
+    gfx->font = NULL;
+    gfx->font_ref = LUA_NOREF;
+
+    /* Anything the stack saved was anchored in a lua state that is gone */
+    memset(g_state.stack, 0, sizeof(g_state.stack));
     g_state.stack_top = 0;
-    mat3_identity(&g_state.matrix_stack[0]);
+    mat3_identity(&g_state.stack[0].matrix);
 }
 
 static void main_loop(void *userdata) {
@@ -1862,7 +2180,7 @@ static void main_loop(void *userdata) {
         return;
     }
 
-    glClearColor(g_state.bg_color[0], g_state.bg_color[1], g_state.bg_color[2], g_state.bg_color[3]);
+    glClearColor(g_state.gfx.bg_color[0], g_state.gfx.bg_color[1], g_state.gfx.bg_color[2], g_state.gfx.bg_color[3]);
     glClear(GL_COLOR_BUFFER_BIT);
 
     reset_graphics_state();
@@ -1892,8 +2210,7 @@ static void close_lua_state(void) {
     g_state.script_entry_point = SCRIPT_ENTRY_NONE;
     g_state.discard_rendering = 0;
     g_state.resource_wait = 0;
-    g_state.current_font = NULL;
-    g_state.current_font_ref = LUA_NOREF;
+    default_graphics_state();
     g_state.key_repeat = 0;
     g_state.quit_requested = 0;
     set_mouse_visible(1);
@@ -1946,9 +2263,6 @@ EMSCRIPTEN_KEEPALIVE int run_lua_code(const char *code) {
 
     /* A run starts from the same window and colors whatever the last one did */
     set_canvas_size(DEFAULT_WIDTH, DEFAULT_HEIGHT);
-    g_state.bg_color[0] = g_state.bg_color[1] = g_state.bg_color[2] = 0.0f;
-    g_state.bg_color[3] = 1.0f;
-    g_state.draw_color[0] = g_state.draw_color[1] = g_state.draw_color[2] = g_state.draw_color[3] = 1.0f;
 
     g_state.L = luaL_newstate();
     if (!g_state.L) {
@@ -2057,14 +2371,9 @@ EMSCRIPTEN_KEEPALIVE void aroma_keyreleased(const char *key) {
 
 int main(void) {
     memset(&g_state, 0, sizeof(g_state));
-    g_state.bg_color[3] = 1.0f;
-    g_state.draw_color[0] = 1.0f;
-    g_state.draw_color[1] = 1.0f;
-    g_state.draw_color[2] = 1.0f;
-    g_state.draw_color[3] = 1.0f;
+    default_graphics_state();
     g_state.script_thread_ref = LUA_NOREF;
     g_state.idle_thread_ref = LUA_NOREF;
-    g_state.current_font_ref = LUA_NOREF;
 
     if (!init_webgl()) {
         return 1;
