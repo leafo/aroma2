@@ -28,8 +28,8 @@ typedef enum { WRAP_CLAMP, WRAP_REPEAT, WRAP_MIRRORED_REPEAT } WrapMode;
 static const char *const filter_names[] = {"linear", "nearest", NULL};
 static const char *const wrap_names[] = {"clamp", "repeat", "mirroredrepeat", NULL};
 
-/* Sampling state of a texture. It lives on the C side so the getters don't
- * need the page, which only hears about changes */
+/* Kept on the C side so the getters don't need the page, which only hears
+ * about changes */
 typedef struct {
     FilterMode min;
     FilterMode mag;
@@ -48,16 +48,14 @@ typedef struct {
     int is_canvas;
 } AromaImage;
 
-/* Pixels on the C side, RGBA bytes with the top row first. Scripts build
- * images in these and hand them to newImage */
+/* RGBA bytes with the top row first */
 typedef struct {
     int width;
     int height;
     unsigned char *pixels;
 } AromaImageData;
 
-/* A rectangle of a texture, sw and sh being the size of the texture it was
- * measured against */
+/* sw, sh are the size of the texture that x, y, w, h were measured against */
 typedef struct {
     float x, y, w, h;
     float sw, sh;
@@ -167,7 +165,6 @@ typedef struct {
     int resource_wait;
     /* Mouse state is pushed in by the page's events so reads from Lua don't
      * cross into JS. Buttons are a bitmask, love's button n is bit n - 1 */
-    /* What new textures are sampled with, setDefaultFilter changes it */
     FilterMode default_min;
     FilterMode default_mag;
     int mouse_x;
@@ -261,8 +258,8 @@ static void mat3_scale(Mat3 *m, float sx, float sy) {
     mat3_multiply(m, m, &s);
 }
 
-/* The transform love's draw calls take: moved to x, y, turned by r, scaled,
- * with ox, oy as the point of the object that lands on x, y */
+/* The transform love's draw calls take, ox, oy being the point of the object
+ * that lands on x, y */
 static void mat3_local(Mat3 *out, const Mat3 *base, float x, float y, float r, float sx, float sy, float ox, float oy) {
     Mat3 local;
     mat3_identity(&local);
@@ -468,8 +465,6 @@ static void default_texture_params(TextureParams *params) {
     params->wrap_v = WRAP_CLAMP;
 }
 
-/* setFilter(min, mag) on a texture whose id and params are given. A texture
- * still loading has no id yet, the params are applied when it arrives */
 static int set_filter(lua_State *L, int texture_id, TextureParams *params) {
     params->min = (FilterMode)luaL_checkoption(L, 2, NULL, filter_names);
     params->mag = (FilterMode)luaL_checkoption(L, 3, filter_names[params->min], filter_names);
@@ -497,8 +492,7 @@ static int get_wrap(lua_State *L, const TextureParams *params) {
     return 2;
 }
 
-/* type() and typeOf() of every object. The names an object answers to are
- * the upvalues, its own type first */
+/* The names an object answers to are the upvalues, its own type first */
 static int l_object_type(lua_State *L) {
     lua_pushvalue(L, lua_upvalueindex(1));
     return 1;
@@ -665,7 +659,6 @@ static float *scratch_floats(lua_State *L, int slot, int count) {
     return g_scratch[slot];
 }
 
-/* Draws untextured x, y pairs in the current color and transform */
 static void draw_solid(const float *coords, int points, GLenum mode) {
     if (g_state.discard_rendering || points <= 0) {
         return;
@@ -695,7 +688,7 @@ static void draw_solid(const float *coords, int points, GLenum mode) {
 
 /* WebGL only has 1 pixel lines, so lines are built as a triangle strip with
  * mitered corners. The width is in the units of the current transform, like
- * love's. closed joins the last point back to the first */
+ * love's */
 static void draw_polyline(lua_State *L, const float *coords, int points, int closed) {
     /* Closing point given twice, as love's polygon vertices allow */
     if (closed && points > 1 &&
@@ -766,8 +759,8 @@ static int check_draw_mode(lua_State *L, int idx) {
     return luaL_checkoption(L, idx, NULL, modes);
 }
 
-/* Reads x, y pairs given as arguments from idx on, or as one table there.
- * Returns the number of points, the coordinates land in scratch slot 0 */
+/* x, y pairs as arguments from idx on, or as one table there. The
+ * coordinates land in scratch slot 0 */
 static int read_points(lua_State *L, int idx, const char *what, float **out) {
     int from_table = lua_istable(L, idx);
     int count = from_table ? (int)lua_rawlen(L, idx) : lua_gettop(L) - idx + 1;
@@ -1002,8 +995,7 @@ static unsigned char color_to_byte(double value) {
     return (unsigned char)(value * 255.0 + 0.5);
 }
 
-/* r, g, b, a from idx on or a table there, alpha defaulting to opaque.
- * Unlike setColor there is no guessing at a 0..255 range */
+/* Unlike setColor there is no guessing at a 0..255 range */
 static void read_pixel_color(lua_State *L, int idx, unsigned char *pixel) {
     if (lua_istable(L, idx)) {
         for (int i = 0; i < 4; i++) {
@@ -1035,8 +1027,6 @@ static int l_imagedata_getPixel(lua_State *L) {
     return 4;
 }
 
-/* mapPixel(fn, [x, y, w, h]) calls fn(x, y, r, g, b, a) for every pixel of
- * the region and stores the color it returns */
 static int l_imagedata_mapPixel(lua_State *L) {
     AromaImageData *data = check_image_data(L, 1);
     luaL_checktype(L, 2, LUA_TFUNCTION);
@@ -1075,8 +1065,8 @@ static int l_imagedata_mapPixel(lua_State *L) {
     return 0;
 }
 
-/* paste(source, dx, dy, [sx, sy, sw, sh]) copies a region of another
- * ImageData in, the parts that fall outside of either are left out */
+/* Parts of the region that fall outside of either ImageData are left out
+ * rather than being an error */
 static int l_imagedata_paste(lua_State *L) {
     AromaImageData *dst = check_image_data(L, 1);
     AromaImageData *src = check_image_data(L, 2);
@@ -1132,8 +1122,7 @@ static int l_imagedata_release(lua_State *L) {
     return 1;
 }
 
-/* An image made from an ImageData is a copy of it as it is now, and is ready
- * right away. Only images loaded from a path have to wait */
+/* Copies the pixels as they are now. Doesn't yield, unlike a load from a path */
 static int new_image_from_data(lua_State *L) {
     AromaImageData *data = check_image_data(L, 1);
 
@@ -1235,13 +1224,12 @@ static GlyphInfo *find_glyph(AromaFont *font, uint32_t codepoint) {
     return NULL;
 }
 
-/* Glyph drawn for a codepoint, the font's ? stands in for ones it lacks */
 static GlyphInfo *glyph_for(AromaFont *font, uint32_t codepoint) {
     GlyphInfo *glyph = find_glyph(font, codepoint);
     return glyph ? glyph : find_glyph(font, (uint32_t)'?');
 }
 
-/* How far a codepoint moves the cursor. Newlines are the caller's business */
+/* Newlines are the caller's business */
 static float glyph_advance(AromaFont *font, uint32_t codepoint) {
     if (codepoint == '\r' || codepoint == '\n') {
         return 0.0f;
@@ -1297,9 +1285,8 @@ static void add_line(lua_State *L, const char *start, const char *end, int hard_
     line->spaces = 0;
 }
 
-/* Splits text into g_lines at newlines, and when limit isn't negative also
- * wherever the next word wouldn't fit. A word wider than the limit on its own
- * is broken where it runs out of room */
+/* A negative limit doesn't wrap. A word wider than the limit on its own is
+ * broken where it runs out of room */
 static void layout_text(lua_State *L, AromaFont *font, const char *text, float limit) {
     g_line_count = 0;
 
@@ -1369,7 +1356,7 @@ static void layout_text(lua_State *L, AromaFont *font, const char *text, float l
 
 typedef enum { ALIGN_LEFT, ALIGN_CENTER, ALIGN_RIGHT, ALIGN_JUSTIFY } TextAlign;
 
-/* Draws g_lines in one call. limit only matters to alignments other than left */
+/* limit only matters to alignments other than left */
 static void draw_text_lines(lua_State *L, AromaFont *font, const Mat3 *transform, TextAlign align, float limit) {
     if (g_state.discard_rendering || font->image_width <= 0) {
         return;
@@ -1586,7 +1573,6 @@ static int l_quad_getViewport(lua_State *L) {
     return 4;
 }
 
-/* setViewport(x, y, w, h, [sw, sh]) */
 static int l_quad_setViewport(lua_State *L) {
     AromaQuad *quad = check_quad(L, 1);
     float x = (float)luaL_checknumber(L, 2);
@@ -1616,7 +1602,6 @@ static int l_quad_getTextureDimensions(lua_State *L) {
     return 2;
 }
 
-/* setDefaultFilter(min, mag) */
 static int l_graphics_setDefaultFilter(lua_State *L) {
     FilterMode min = (FilterMode)luaL_checkoption(L, 1, NULL, filter_names);
     g_state.default_mag = (FilterMode)luaL_checkoption(L, 2, filter_names[min], filter_names);
@@ -1702,8 +1687,7 @@ static int l_image_getWrap(lua_State *L) {
     return get_wrap(L, &check_texture(L, 1)->params);
 }
 
-/* Frees the texture now rather than whenever the collector gets to it. The
- * image draws nothing afterwards. Also the __gc */
+/* Also the __gc. A released image draws nothing */
 static int l_image_release(lua_State *L) {
     AromaImage *img = check_texture(L, 1);
     /* Releasing the canvas being drawn to goes back to the window. Only by
@@ -1805,7 +1789,6 @@ static void check_text_transform(lua_State *L, int idx, float x, float y, Mat3 *
     mat3_local(out, current_matrix(), x, y, r, sx, sy, ox, oy);
 }
 
-/* print(text, x, y, r, sx, sy, ox, oy) */
 static int l_graphics_print(lua_State *L) {
     const char *text = luaL_checkstring(L, 1);
     float x = (float)luaL_optnumber(L, 2, 0.0);
@@ -1823,7 +1806,6 @@ static int l_graphics_print(lua_State *L) {
     return 0;
 }
 
-/* printf(text, x, y, limit, align, r, sx, sy, ox, oy) */
 static int l_graphics_printf(lua_State *L) {
     static const char *const aligns[] = {"left", "center", "right", "justify", NULL};
 
@@ -1845,7 +1827,6 @@ static int l_graphics_printf(lua_State *L) {
     return 0;
 }
 
-/* Width of the widest line */
 static int l_font_getWidth(lua_State *L) {
     AromaFont *font = check_font(L, 1);
     const char *text = luaL_checkstring(L, 2);
@@ -1883,7 +1864,6 @@ static int l_font_setLineHeight(lua_State *L) {
     return 0;
 }
 
-/* getWrap(text, limit) returns the widest line and the lines as a table */
 static int l_font_getWrap(lua_State *L) {
     AromaFont *font = check_font(L, 1);
     const char *text = luaL_checkstring(L, 2);
@@ -3323,7 +3303,6 @@ static void close_lua_state(void) {
     set_mouse_visible(1);
 }
 
-/* Runs love.quit and returns whether it asked to keep going */
 static int quit_aborted(void) {
     lua_State *T = script_thread_begin(SCRIPT_ENTRY_QUIT);
     if (!T) return 0;
@@ -3345,9 +3324,8 @@ static int quit_aborted(void) {
     return aborted;
 }
 
-/* Acts on a quit asked for during the entry point that just ran. A quit from
- * an entry point that is still suspended on a load waits for it to finish.
- * Returns whether the state was closed */
+/* A quit from an entry point that is still suspended on a load waits for it
+ * to finish. Returns whether the state was closed */
 static int finish_quit(void) {
     if (!g_state.quit_requested || !g_state.L || g_state.script_thread) {
         return 0;
