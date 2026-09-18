@@ -237,6 +237,11 @@ export async function initAroma(canvas, options = {}) {
       return store ? store.createCanvas(width, height) : 0;
     };
 
+    Module.attachCanvasDepth = (id) => {
+      const store = ensureTextureStore(Module);
+      return store && store.attachDepth(id) ? 1 : 0;
+    };
+
     Module.bindFramebuffer = (id) => {
       const store = ensureTextureStore(Module);
       if (store) {

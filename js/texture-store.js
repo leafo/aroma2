@@ -128,11 +128,27 @@ export function createTextureStore(gl) {
     return true;
   }
 
+  // Gives a canvas a depth buffer. Leaves its framebuffer bound
+  function attachDepth(id) {
+    const entry = textures.get(id);
+    if (!entry || !entry.framebuffer) return false;
+    if (entry.depth) return true;
+    entry.depth = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, entry.depth);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, entry.width, entry.height);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, entry.framebuffer);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, entry.depth);
+    return gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+  }
+
   function release(id) {
     const entry = textures.get(id);
     if (!entry) return;
     if (entry.framebuffer) {
       gl.deleteFramebuffer(entry.framebuffer);
+    }
+    if (entry.depth) {
+      gl.deleteRenderbuffer(entry.depth);
     }
     gl.deleteTexture(entry.tex);
     textures.delete(id);
@@ -143,6 +159,7 @@ export function createTextureStore(gl) {
     createFromSource,
     createFromPixels,
     createCanvas,
+    attachDepth,
     bindFramebuffer,
     setParams,
     bind,

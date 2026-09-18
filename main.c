@@ -51,6 +51,8 @@ typedef struct {
     /* A Canvas shares this struct so that drawing and sampling treat the two
      * alike, only the metatable differs */
     int is_canvas;
+    /* Set once setCanvas has asked for depth, the buffer stays attached */
+    int has_depth;
 } AromaImage;
 
 /* RGBA bytes with the top row first */
@@ -140,18 +142,36 @@ typedef struct {
     int instance_id;
 } AromaJoystick;
 
-#define MESH_VERTEX_FLOATS 8
+#define MESH_MAX_ATTRIBUTES 8
 
-/* Vertices are x, y, u, v, r, g, b, a. The copy in vertices is what getVertex
- * reads and setVertex uploads from. The texture is anchored by the
- * userdata's uservalue */
+typedef struct {
+    char name[32];
+    int components;
+    /* In floats from the start of the vertex */
+    int offset;
+} MeshAttribute;
+
+/* Every component is kept as a float whatever the format said. The copy in
+ * vertices is what getVertex reads and setVertex uploads from. The texture
+ * is anchored by the userdata's uservalue */
 typedef struct {
     GLuint buffer;
     GLenum mode;
     int count;
     float *vertices;
     AromaImage *texture;
+    MeshAttribute attributes[MESH_MAX_ATTRIBUTES];
+    int attribute_count;
+    int floats;
 } AromaMesh;
+
+typedef enum { CULL_NONE, CULL_BACK, CULL_FRONT } CullMode;
+typedef enum { WINDING_CCW, WINDING_CW } Winding;
+
+static const char *const cull_mode_names[] = {"none", "back", "front", NULL};
+static const char *const winding_names[] = {"ccw", "cw", NULL};
+/* Ordered like GL_NEVER.. GL_ALWAYS */
+static const char *const compare_mode_names[] = {"never", "less", "equal", "lequal", "greater", "notequal", "gequal", "always", NULL};
 
 /* sw, sh are the size of the texture that x, y, w, h were measured against */
 typedef struct {
@@ -229,6 +249,11 @@ typedef struct {
     /* NULL draws with the built in program */
     AromaShader *shader;
     int shader_ref;
+    /* Index into compare_mode_names */
+    int depth_compare;
+    int depth_write;
+    CullMode cull_mode;
+    Winding winding;
     BlendMode blend_mode;
     BlendAlphaMode blend_alpha;
     int scissor_enabled;
@@ -328,7 +353,9 @@ static EngineState g_state;
 static void poll_joysticks(void);
 static void apply_render_target(void);
 static void apply_scissor(void);
+static void apply_winding(void);
 static void apply_blend_mode(void);
+static void apply_depth_mode(void);
 
 static const char *vertex_shader_source =
     "attribute vec2 aPosition;\n"
@@ -547,6 +574,10 @@ EM_JS(void, js_audio_release, (int source_id), {
 
 EM_JS(void, js_audio_set_master_volume, (double volume), {
   Module.audio.setMasterVolume(volume);
+});
+
+EM_JS(int, js_attach_canvas_depth, (int texture_id), {
+  return Module.attachCanvasDepth(texture_id);
 });
 
 EM_JS(int, js_create_canvas, (int width, int height), {
@@ -884,6 +915,7 @@ static void pop_stack_entry(lua_State *L) {
         entry->has_state = 0;
         apply_render_target();
         apply_blend_mode();
+        apply_depth_mode();
     }
     g_state.stack_top--;
 }
@@ -1923,69 +1955,146 @@ static AromaMesh *check_mesh(lua_State *L, int idx) {
     return mesh;
 }
 
-/* A vertex is {x, y, u, v, r, g, b, a}, everything after y optional */
-static void read_mesh_vertex(lua_State *L, int idx, float *vertex) {
-    static const float defaults[MESH_VERTEX_FLOATS] = {0, 0, 0, 0, 1, 1, 1, 1};
+/* Missing components are 0, except a color's which are 1 */
+static float attribute_default(const MeshAttribute *attribute) {
+    return strcmp(attribute->name, "VertexColor") == 0 ? 1.0f : 0.0f;
+}
+
+static void read_mesh_vertex(lua_State *L, int idx, const AromaMesh *mesh, float *vertex) {
     luaL_checktype(L, idx, LUA_TTABLE);
-    for (int i = 0; i < MESH_VERTEX_FLOATS; i++) {
-        lua_rawgeti(L, idx, i + 1);
-        vertex[i] = (float)luaL_optnumber(L, -1, defaults[i]);
-        lua_pop(L, 1);
+    for (int a = 0; a < mesh->attribute_count; a++) {
+        const MeshAttribute *attribute = &mesh->attributes[a];
+        for (int c = 0; c < attribute->components; c++) {
+            lua_rawgeti(L, idx, attribute->offset + c + 1);
+            vertex[attribute->offset + c] = (float)luaL_optnumber(L, -1, attribute_default(attribute));
+            lua_pop(L, 1);
+        }
     }
 }
 
-/* newMesh(vertices, [mode], [usage]) or newMesh(count, [mode], [usage]). Only
- * love's standard vertex format, the usage hint is ignored */
+static void standard_mesh_format(AromaMesh *mesh) {
+    static const MeshAttribute standard[] = {
+        {"VertexPosition", 2, 0}, {"VertexTexCoord", 2, 2}, {"VertexColor", 4, 4},
+    };
+    memcpy(mesh->attributes, standard, sizeof(standard));
+    mesh->attribute_count = 3;
+    mesh->floats = 8;
+}
+
+/* A format is a table of {name, datatype, components}. Bytes are taken as
+ * floats in 0 to 1, which is how love has them written anyway */
+static void read_mesh_format(lua_State *L, int idx, AromaMesh *mesh) {
+    static const char *const datatypes[] = {"float", "byte", "unorm8", "unorm16", NULL};
+    int count = (int)lua_rawlen(L, idx);
+    if (count < 1 || count > MESH_MAX_ATTRIBUTES) {
+        luaL_error(L, "love.graphics.newMesh: a vertex format takes 1 to %d attributes", MESH_MAX_ATTRIBUTES);
+    }
+
+    mesh->floats = 0;
+    for (int i = 0; i < count; i++) {
+        MeshAttribute *attribute = &mesh->attributes[i];
+        lua_rawgeti(L, idx, i + 1);
+        if (!lua_istable(L, -1)) {
+            luaL_error(L, "love.graphics.newMesh: vertex attribute %d must be a table", i + 1);
+        }
+        lua_rawgeti(L, -1, 1);
+        const char *name = luaL_checkstring(L, -1);
+        if (strlen(name) >= sizeof(attribute->name)) {
+            luaL_error(L, "love.graphics.newMesh: vertex attribute name '%s' is too long", name);
+        }
+        strcpy(attribute->name, name);
+        lua_rawgeti(L, -2, 2);
+        luaL_checkoption(L, -1, NULL, datatypes);
+        lua_rawgeti(L, -3, 3);
+        attribute->components = (int)luaL_checkinteger(L, -1);
+        if (attribute->components < 1 || attribute->components > 4) {
+            luaL_error(L, "love.graphics.newMesh: vertex attribute '%s' must have 1 to 4 components", name);
+        }
+        attribute->offset = mesh->floats;
+        mesh->floats += attribute->components;
+        lua_pop(L, 4);
+    }
+    mesh->attribute_count = count;
+}
+
+/* Whether a table holds a vertex format rather than vertices */
+static int is_vertex_format(lua_State *L, int idx) {
+    int result = 0;
+    lua_rawgeti(L, idx, 1);
+    if (lua_istable(L, -1)) {
+        lua_rawgeti(L, -1, 1);
+        result = lua_type(L, -1) == LUA_TSTRING;
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+    return result;
+}
+
+/* newMesh(vertices or count, [mode], [usage]) in love's standard format, or
+ * newMesh(format, vertices or count, [mode], [usage]). The usage hint is
+ * ignored */
 static int l_graphics_newMesh(lua_State *L) {
     static const char *const modes[] = {"fan", "strip", "triangles", "points", NULL};
     static const GLenum gl_modes[] = {GL_TRIANGLE_FAN, GL_TRIANGLE_STRIP, GL_TRIANGLES, GL_POINTS};
-
-    int from_table = lua_istable(L, 1);
-    int count = from_table ? (int)lua_rawlen(L, 1) : (int)luaL_checkinteger(L, 1);
-    luaL_argcheck(L, count > 0, 1, "a mesh needs at least 1 vertex");
-
-    if (from_table) {
-        /* A vertex format is a table of tables of strings, vertices of numbers */
-        lua_rawgeti(L, 1, 1);
-        if (lua_istable(L, -1)) {
-            lua_rawgeti(L, -1, 1);
-            if (lua_type(L, -1) == LUA_TSTRING) {
-                return luaL_error(L, "love.graphics.newMesh: custom vertex formats aren't supported yet");
-            }
-            lua_pop(L, 1);
-        }
-        lua_pop(L, 1);
-    }
-
-    int mode = luaL_checkoption(L, 2, "fan", modes);
 
     AromaMesh *mesh = (AromaMesh *)lua_newuserdata(L, sizeof(AromaMesh));
     memset(mesh, 0, sizeof(AromaMesh));
     luaL_getmetatable(L, "aroma.mesh");
     lua_setmetatable(L, -2);
 
+    int vertices_index = 1;
+    if (lua_istable(L, 1) && is_vertex_format(L, 1)) {
+        read_mesh_format(L, 1, mesh);
+        vertices_index = 2;
+    } else {
+        standard_mesh_format(mesh);
+    }
+
+    int from_table = lua_istable(L, vertices_index);
+    int count = from_table ? (int)lua_rawlen(L, vertices_index) : (int)luaL_checkinteger(L, vertices_index);
+    luaL_argcheck(L, count > 0, vertices_index, "a mesh needs at least 1 vertex");
+    int mode = luaL_checkoption(L, vertices_index + 1, "fan", modes);
+
     mesh->mode = gl_modes[mode];
     mesh->count = count;
-    mesh->vertices = (float *)calloc((size_t)count, sizeof(float) * MESH_VERTEX_FLOATS);
+    mesh->vertices = (float *)calloc((size_t)count, sizeof(float) * mesh->floats);
     if (!mesh->vertices) {
         return luaL_error(L, "love.graphics.newMesh: out of memory");
     }
 
     for (int i = 0; i < count; i++) {
-        float *vertex = &mesh->vertices[i * MESH_VERTEX_FLOATS];
+        float *vertex = &mesh->vertices[i * mesh->floats];
         if (from_table) {
-            lua_rawgeti(L, 1, i + 1);
-            read_mesh_vertex(L, lua_gettop(L), vertex);
+            lua_rawgeti(L, vertices_index, i + 1);
+            read_mesh_vertex(L, lua_gettop(L), mesh, vertex);
             lua_pop(L, 1);
         } else {
-            vertex[4] = vertex[5] = vertex[6] = vertex[7] = 1.0f;
+            for (int a = 0; a < mesh->attribute_count; a++) {
+                const MeshAttribute *attribute = &mesh->attributes[a];
+                for (int c = 0; c < attribute->components; c++) {
+                    vertex[attribute->offset + c] = attribute_default(attribute);
+                }
+            }
         }
     }
 
     glGenBuffers(1, &mesh->buffer);
     glBindBuffer(GL_ARRAY_BUFFER, mesh->buffer);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(float) * MESH_VERTEX_FLOATS * count, mesh->vertices, GL_STATIC_DRAW);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(float) * mesh->floats * count, mesh->vertices, GL_STATIC_DRAW);
     return 1;
+}
+
+/* The slot an attribute feeds: the fixed ones of the built in program, which
+ * custom shaders share, and any other by name from the active shader */
+static GLint mesh_attribute_location(const MeshAttribute *attribute) {
+    if (strcmp(attribute->name, "VertexPosition") == 0) return 0;
+    if (strcmp(attribute->name, "VertexTexCoord") == 0) return 1;
+    if (strcmp(attribute->name, "VertexColor") == 0) return 2;
+    AromaShader *shader = g_state.gfx.shader;
+    if (!shader || !shader->program) {
+        return -1;
+    }
+    return glGetAttribLocation(shader->program, attribute->name);
 }
 
 static int draw_mesh(lua_State *L) {
@@ -2012,19 +2121,43 @@ static int draw_mesh(lua_State *L) {
     /* A texture that was released draws as if there was none */
     begin_draw(&final, texture && texture->loaded ? texture->texture_id : 0);
 
-    GLsizei stride = sizeof(float) * MESH_VERTEX_FLOATS;
+    /* Slots a mesh doesn't feed fall back to their constants: no texture
+     * coordinates and white */
+    glDisableVertexAttribArray(1);
+    glVertexAttrib2f(1, 0.0f, 0.0f);
+    glDisableVertexAttribArray(2);
+    glVertexAttrib4f(2, 1.0f, 1.0f, 1.0f, 1.0f);
+
+    GLsizei stride = (GLsizei)(sizeof(float) * mesh->floats);
+    GLint enabled[MESH_MAX_ATTRIBUTES];
+    int enabled_count = 0;
     glBindBuffer(GL_ARRAY_BUFFER, mesh->buffer);
-    glEnableVertexAttribArray(0);
-    glEnableVertexAttribArray(1);
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride, (const void *)0);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, stride, (const void *)(sizeof(float) * 2));
-    glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, stride, (const void *)(sizeof(float) * 4));
+    for (int a = 0; a < mesh->attribute_count; a++) {
+        const MeshAttribute *attribute = &mesh->attributes[a];
+        GLint location = mesh_attribute_location(attribute);
+        if (location < 0) {
+            continue;
+        }
+        glEnableVertexAttribArray((GLuint)location);
+        glVertexAttribPointer((GLuint)location, attribute->components, GL_FLOAT, GL_FALSE, stride,
+                              (const void *)(sizeof(float) * attribute->offset));
+        enabled[enabled_count++] = location;
+    }
+
+    if (g_state.gfx.cull_mode != CULL_NONE) {
+        glEnable(GL_CULL_FACE);
+        glCullFace(g_state.gfx.cull_mode == CULL_BACK ? GL_BACK : GL_FRONT);
+    }
 
     glDrawArrays(mesh->mode, 0, mesh->count);
 
-    glDisableVertexAttribArray(1);
-    glDisableVertexAttribArray(2);
+    glDisable(GL_CULL_FACE);
+    /* Slot 0 stays enabled, every draw feeds it */
+    for (int i = 0; i < enabled_count; i++) {
+        if (enabled[i] != 0) {
+            glDisableVertexAttribArray((GLuint)enabled[i]);
+        }
+    }
     return 0;
 }
 
@@ -2063,36 +2196,53 @@ static int l_mesh_getVertexCount(lua_State *L) {
 static float *check_mesh_vertex(lua_State *L, AromaMesh *mesh, int idx) {
     int index = (int)luaL_checkinteger(L, idx);
     luaL_argcheck(L, index >= 1 && index <= mesh->count, idx, "vertex index out of range");
-    return &mesh->vertices[(index - 1) * MESH_VERTEX_FLOATS];
+    return &mesh->vertices[(index - 1) * mesh->floats];
 }
 
 static int l_mesh_getVertex(lua_State *L) {
     AromaMesh *mesh = check_mesh(L, 1);
     float *vertex = check_mesh_vertex(L, mesh, 2);
-    for (int i = 0; i < MESH_VERTEX_FLOATS; i++) {
+    luaL_checkstack(L, mesh->floats, "vertex");
+    for (int i = 0; i < mesh->floats; i++) {
         lua_pushnumber(L, vertex[i]);
     }
-    return MESH_VERTEX_FLOATS;
+    return mesh->floats;
 }
 
-/* setVertex(index, x, y, u, v, r, g, b, a) or setVertex(index, vertex) */
+/* setVertex(index, components...) or setVertex(index, vertex) */
 static int l_mesh_setVertex(lua_State *L) {
     AromaMesh *mesh = check_mesh(L, 1);
     float *vertex = check_mesh_vertex(L, mesh, 2);
 
     if (lua_istable(L, 3)) {
-        read_mesh_vertex(L, 3, vertex);
+        read_mesh_vertex(L, 3, mesh, vertex);
     } else {
         /* Components that aren't given keep their value, as in love */
-        for (int i = 0; i < MESH_VERTEX_FLOATS; i++) {
+        for (int i = 0; i < mesh->floats; i++) {
             vertex[i] = (float)luaL_optnumber(L, 3 + i, vertex[i]);
         }
     }
 
     glBindBuffer(GL_ARRAY_BUFFER, mesh->buffer);
     glBufferSubData(GL_ARRAY_BUFFER, (char *)vertex - (char *)mesh->vertices,
-                    sizeof(float) * MESH_VERTEX_FLOATS, vertex);
+                    sizeof(float) * mesh->floats, vertex);
     return 0;
+}
+
+static int l_mesh_getVertexFormat(lua_State *L) {
+    AromaMesh *mesh = check_mesh(L, 1);
+    lua_createtable(L, mesh->attribute_count, 0);
+    for (int a = 0; a < mesh->attribute_count; a++) {
+        lua_createtable(L, 3, 0);
+        lua_pushstring(L, mesh->attributes[a].name);
+        lua_rawseti(L, -2, 1);
+        lua_pushliteral(L, "float");
+        lua_rawseti(L, -2, 2);
+        lua_pushinteger(L, mesh->attributes[a].components);
+        lua_rawseti(L, -2, 3);
+        lua_rawseti(L, -2, a + 1);
+    }
+    return 1;
 }
 
 /* Also the __gc */
@@ -3482,6 +3632,72 @@ static void apply_render_target(void) {
     glViewport(0, 0, width, height);
     setup_projection((float)width, (float)height, canvas != NULL);
     apply_scissor();
+    apply_winding();
+}
+
+/* Winding is as it looks on the screen. A canvas is drawn into upside down,
+ * which mirrors it */
+static void apply_winding(void) {
+    int ccw = g_state.gfx.winding == WINDING_CCW;
+    if (g_state.gfx.canvas) {
+        ccw = !ccw;
+    }
+    glFrontFace(ccw ? GL_CCW : GL_CW);
+}
+
+static void apply_depth_mode(void) {
+    if (!g_state.gl_context) {
+        return;
+    }
+    int always = g_state.gfx.depth_compare == 7;
+    if (always && !g_state.gfx.depth_write) {
+        glDisable(GL_DEPTH_TEST);
+    } else {
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_NEVER + g_state.gfx.depth_compare);
+    }
+    glDepthMask(g_state.gfx.depth_write ? GL_TRUE : GL_FALSE);
+}
+
+static int l_graphics_setDepthMode(lua_State *L) {
+    if (lua_isnoneornil(L, 1)) {
+        g_state.gfx.depth_compare = 7;
+        g_state.gfx.depth_write = 0;
+    } else {
+        g_state.gfx.depth_compare = luaL_checkoption(L, 1, NULL, compare_mode_names);
+        luaL_checktype(L, 2, LUA_TBOOLEAN);
+        g_state.gfx.depth_write = lua_toboolean(L, 2);
+    }
+    apply_depth_mode();
+    return 0;
+}
+
+static int l_graphics_getDepthMode(lua_State *L) {
+    lua_pushstring(L, compare_mode_names[g_state.gfx.depth_compare]);
+    lua_pushboolean(L, g_state.gfx.depth_write);
+    return 2;
+}
+
+/* Only meshes are culled, as in love */
+static int l_graphics_setMeshCullMode(lua_State *L) {
+    g_state.gfx.cull_mode = (CullMode)luaL_checkoption(L, 1, NULL, cull_mode_names);
+    return 0;
+}
+
+static int l_graphics_getMeshCullMode(lua_State *L) {
+    lua_pushstring(L, cull_mode_names[g_state.gfx.cull_mode]);
+    return 1;
+}
+
+static int l_graphics_setFrontFaceWinding(lua_State *L) {
+    g_state.gfx.winding = (Winding)luaL_checkoption(L, 1, NULL, winding_names);
+    apply_winding();
+    return 0;
+}
+
+static int l_graphics_getFrontFaceWinding(lua_State *L) {
+    lua_pushstring(L, winding_names[g_state.gfx.winding]);
+    return 1;
 }
 
 static void apply_scissor(void) {
@@ -4111,10 +4327,26 @@ static void set_canvas(lua_State *L, int idx) {
 
 /* love's table form setCanvas({canvas, depth = ...}) is accepted, its
  * options are ignored for now */
+/* setCanvas(canvas) or setCanvas({canvas, depth = true}). A depth buffer is
+ * attached to the canvas the first time it's asked for and kept */
 static int l_graphics_setCanvas(lua_State *L) {
     if (lua_istable(L, 1)) {
+        lua_getfield(L, 1, "depth");
+        int want_depth = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+
         lua_rawgeti(L, 1, 1);
-        set_canvas(L, lua_gettop(L));
+        int canvas_index = lua_gettop(L);
+        if (want_depth && !lua_isnil(L, canvas_index)) {
+            AromaImage *canvas = (AromaImage *)luaL_checkudata(L, canvas_index, "aroma.canvas");
+            if (canvas->loaded && !canvas->has_depth) {
+                if (!js_attach_canvas_depth(canvas->texture_id)) {
+                    return luaL_error(L, "love.graphics.setCanvas: couldn't attach a depth buffer to the canvas");
+                }
+                canvas->has_depth = 1;
+            }
+        }
+        set_canvas(L, canvas_index);
         return 0;
     }
     set_canvas(L, 1);
@@ -4132,18 +4364,48 @@ static int l_graphics_getCanvas(lua_State *L) {
 
 /* Without a color this is transparent black as of love 11, not the
  * background color */
+/* clear([color], [stencil], [depth]). The color can be r, g, b, a, a table
+ * or false to leave the color alone. Stencil values are accepted and
+ * ignored, there is no stencil buffer */
 static int l_graphics_clear(lua_State *L) {
     float color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    if (!lua_isnoneornil(L, 1)) {
+    int clear_color = 1;
+    int next = 1;
+    if (lua_isboolean(L, 1)) {
+        clear_color = lua_toboolean(L, 1);
+        next = 2;
+    } else if (lua_istable(L, 1)) {
         parse_color(L, 1, color);
+        next = 2;
+    } else if (!lua_isnoneornil(L, 1)) {
+        parse_color(L, 1, color);
+        next = 5;
     }
+    /* The depth comes after the stencil */
+    int clear_depth = lua_isnumber(L, next + 1);
+    float depth = clear_depth ? (float)lua_tonumber(L, next + 1) : 1.0f;
 
     if (g_state.discard_rendering) {
         return 0;
     }
 
-    glClearColor(color[0], color[1], color[2], color[3]);
-    glClear(GL_COLOR_BUFFER_BIT);
+    GLbitfield bits = 0;
+    if (clear_color) {
+        glClearColor(color[0], color[1], color[2], color[3]);
+        bits |= GL_COLOR_BUFFER_BIT;
+    }
+    if (clear_depth) {
+        /* The depth mask gates clears too */
+        glDepthMask(GL_TRUE);
+        glClearDepthf(depth);
+        bits |= GL_DEPTH_BUFFER_BIT;
+    }
+    if (bits) {
+        glClear(bits);
+    }
+    if (clear_depth) {
+        glDepthMask(g_state.gfx.depth_write ? GL_TRUE : GL_FALSE);
+    }
     return 0;
 }
 
@@ -4666,6 +4928,8 @@ static void register_aroma_api(lua_State *L) {
         lua_setfield(L, -2, "getVertex");
         lua_pushcfunction(L, l_mesh_setVertex);
         lua_setfield(L, -2, "setVertex");
+        lua_pushcfunction(L, l_mesh_getVertexFormat);
+        lua_setfield(L, -2, "getVertexFormat");
         lua_pushcfunction(L, l_mesh_release);
         lua_setfield(L, -2, "release");
         register_object_type(L, (const char *const[]){"Mesh", "Drawable", "Object", NULL});
@@ -4838,6 +5102,18 @@ static void register_aroma_api(lua_State *L) {
 
     lua_pushcfunction(L, l_graphics_newCanvas);
     lua_setfield(L, -2, "newCanvas");
+    lua_pushcfunction(L, l_graphics_setDepthMode);
+    lua_setfield(L, -2, "setDepthMode");
+    lua_pushcfunction(L, l_graphics_getDepthMode);
+    lua_setfield(L, -2, "getDepthMode");
+    lua_pushcfunction(L, l_graphics_setMeshCullMode);
+    lua_setfield(L, -2, "setMeshCullMode");
+    lua_pushcfunction(L, l_graphics_getMeshCullMode);
+    lua_setfield(L, -2, "getMeshCullMode");
+    lua_pushcfunction(L, l_graphics_setFrontFaceWinding);
+    lua_setfield(L, -2, "setFrontFaceWinding");
+    lua_pushcfunction(L, l_graphics_getFrontFaceWinding);
+    lua_setfield(L, -2, "getFrontFaceWinding");
     lua_pushcfunction(L, l_graphics_newShader);
     lua_setfield(L, -2, "newShader");
     lua_pushcfunction(L, l_graphics_setShader);
@@ -5375,6 +5651,10 @@ static void default_graphics_state(void) {
     gfx->canvas_ref = LUA_NOREF;
     gfx->shader = NULL;
     gfx->shader_ref = LUA_NOREF;
+    gfx->depth_compare = 7; /* always */
+    gfx->depth_write = 0;
+    gfx->cull_mode = CULL_NONE;
+    gfx->winding = WINDING_CCW;
     gfx->blend_mode = BLEND_ALPHA;
     gfx->blend_alpha = BLEND_ALPHA_MULTIPLY;
     gfx->scissor_enabled = 0;
